@@ -39,13 +39,29 @@ struct RestErrorStatus {
 pub struct RestTransport {
     client: Client,
     base_url: String,
+    max_response_bytes: usize,
 }
 
 impl RestTransport {
     /// Build a `RestTransport` from a pre-constructed `reqwest::Client`.
     pub fn new(client: Client, base_url: String) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
-        RestTransport { client, base_url }
+        RestTransport {
+            client,
+            base_url,
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
+        }
+    }
+
+    /// Caps the response body this transport will buffer, in bytes.
+    ///
+    /// A larger body is refused with an error instead of being read into
+    /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
+    /// Streaming (SSE) responses are not buffered and are not subject to it.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
     }
 
     fn build_request(
@@ -85,9 +101,19 @@ impl RestTransport {
         wire::send(&self.client, builder).await
     }
 
-    async fn into_rest_error(resp: reqwest::Response) -> A2AError {
+    async fn rest_error_from_response(&self, resp: reqwest::Response) -> A2AError {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = match wire::read_capped_text(
+            resp,
+            self.max_response_bytes,
+            "failed to read error response",
+        )
+        .await
+        {
+            Ok(body) => body,
+            // An oversized or unreadable error body is reported as such.
+            Err(read_error) => return read_error,
+        };
         // A failing response is the one a person reaches for --debug to see,
         // so log it on the way to being turned into an error.
         wire::log_response(status, &body);
@@ -114,11 +140,10 @@ impl RestTransport {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(Self::into_rest_error(resp).await);
+            return Err(self.rest_error_from_response(resp).await);
         }
-        let body = wire::response_text(resp)
-            .await
-            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        let body =
+            wire::response_text(resp, self.max_response_bytes, "failed to parse response").await?;
         let payload = serde_json::from_str::<Value>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
@@ -153,11 +178,10 @@ impl RestTransport {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(Self::into_rest_error(resp).await);
+            return Err(self.rest_error_from_response(resp).await);
         }
-        let body = wire::response_text(resp)
-            .await
-            .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
+        let body =
+            wire::response_text(resp, self.max_response_bytes, "failed to parse response").await?;
         let payload = serde_json::from_str::<Value>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse response: {e}")))?;
 
@@ -201,7 +225,7 @@ impl RestTransport {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(Self::into_rest_error(resp).await);
+            return Err(self.rest_error_from_response(resp).await);
         }
 
         let stream = resp.bytes_stream();
@@ -221,7 +245,7 @@ impl RestTransport {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(Self::into_rest_error(resp).await);
+            return Err(self.rest_error_from_response(resp).await);
         }
 
         let stream = resp.bytes_stream();
@@ -234,7 +258,7 @@ impl RestTransport {
             .await?;
 
         if !resp.status().is_success() {
-            return Err(Self::into_rest_error(resp).await);
+            return Err(self.rest_error_from_response(resp).await);
         }
         Ok(())
     }
@@ -441,6 +465,7 @@ impl Transport for RestTransport {
 /// Factory for creating [`RestTransport`] instances.
 pub struct RestTransportFactory {
     client: Client,
+    max_response_bytes: usize,
 }
 
 impl RestTransportFactory {
@@ -448,7 +473,16 @@ impl RestTransportFactory {
         RestTransportFactory {
             client: client
                 .unwrap_or_else(|| crate::default_reqwest_client(None).expect("default client")),
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
         }
+    }
+
+    /// Caps the response body size of every transport this factory creates.
+    /// See [`RestTransport::with_max_response_bytes`].
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
     }
 
     #[cfg(any(
@@ -474,10 +508,10 @@ impl TransportFactory for RestTransportFactory {
         _card: &AgentCard,
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError> {
-        Ok(Box::new(RestTransport::new(
-            self.client.clone(),
-            iface.url.clone(),
-        )))
+        Ok(Box::new(
+            RestTransport::new(self.client.clone(), iface.url.clone())
+                .with_max_response_bytes(self.max_response_bytes),
+        ))
     }
 }
 

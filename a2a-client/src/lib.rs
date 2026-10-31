@@ -35,6 +35,7 @@ pub use client::A2AClient;
 pub use factory::A2AClientFactory;
 pub use futures::stream::BoxStream;
 pub use transport::{ServiceParams, Transport, TransportFactory};
+pub use wire::DEFAULT_MAX_RESPONSE_BODY_BYTES;
 
 #[cfg(any(feature = "rustls-tls", feature = "rustls-no-provider"))]
 pub use rustls;

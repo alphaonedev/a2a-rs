@@ -7,6 +7,7 @@ use reqwest::Client;
 /// Resolves agent cards from `.well-known/agent-card.json` endpoints.
 pub struct AgentCardResolver {
     client: Client,
+    max_response_bytes: usize,
 }
 
 impl AgentCardResolver {
@@ -14,7 +15,17 @@ impl AgentCardResolver {
         AgentCardResolver {
             client: client
                 .unwrap_or_else(|| crate::default_reqwest_client(None).expect("default client")),
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
         }
+    }
+
+    /// Caps the agent card body this resolver will buffer, in bytes.
+    ///
+    /// Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
     }
 
     /// Resolve an agent card from the given base URL.
@@ -40,8 +51,13 @@ impl AgentCardResolver {
             )));
         }
 
-        resp.json::<AgentCard>()
-            .await
+        let body = crate::wire::read_capped_text(
+            resp,
+            self.max_response_bytes,
+            "failed to parse agent card",
+        )
+        .await?;
+        serde_json::from_str::<AgentCard>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse agent card: {e}")))
     }
 }

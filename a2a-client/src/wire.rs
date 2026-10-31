@@ -102,11 +102,62 @@ pub(crate) async fn send(
 /// Reads a response body to text, logging status and body, so callers parse
 /// from the string instead of `Response::json` — the raw bytes have to be seen
 /// first. The error is unmapped so each caller keeps its own message.
-pub(crate) async fn response_text(resp: reqwest::Response) -> Result<String, reqwest::Error> {
+pub(crate) async fn response_text(
+    resp: reqwest::Response,
+    max_bytes: usize,
+    context: &str,
+) -> Result<String, A2AError> {
     let status = resp.status();
-    let text = resp.text().await?;
+    let text = read_capped_text(resp, max_bytes, context).await?;
     log_response(status, &text);
     Ok(text)
+}
+
+/// Default cap, in bytes, on a response body the client will buffer.
+///
+/// Sized like the server's request body limit (`MAX_REQUEST_BODY_BYTES`,
+/// 10 MiB), so a peer is held to the same bound in both directions. Override
+/// it per transport with `with_max_response_bytes`.
+pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+fn response_too_large(max_bytes: usize) -> A2AError {
+    A2AError::internal(format!("response body exceeds the {max_bytes} byte limit"))
+}
+
+/// Reads a response body into a string without ever holding more than
+/// `max_bytes` of it.
+///
+/// A declared `Content-Length` over the cap is refused before any body byte
+/// is read; a body that is chunked, or that lies about its length, is counted
+/// as it streams and abandoned the moment it crosses the cap. `context`
+/// prefixes a transport read failure, so each caller keeps its own message.
+pub(crate) async fn read_capped_text(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    context: &str,
+) -> Result<String, A2AError> {
+    if resp
+        .content_length()
+        .is_some_and(|declared| declared > max_bytes as u64)
+    {
+        return Err(response_too_large(max_bytes));
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| A2AError::internal(format!("{context}: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(response_too_large(max_bytes));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    // A2A bodies are UTF-8 JSON; `text()` would also honour a declared
+    // charset, which only matters for a peer that is not speaking A2A.
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Logs a response that the caller has already read the body of.

@@ -42,12 +42,28 @@ fn parse_jsonrpc_error(err: JsonRpcError) -> A2AError {
 pub struct JsonRpcTransport {
     client: Client,
     endpoint: String,
+    max_response_bytes: usize,
 }
 
 impl JsonRpcTransport {
     /// Build a `JsonRpcTransport` from a pre-constructed `reqwest::Client`.
     pub fn new(client: Client, endpoint: String) -> Self {
-        JsonRpcTransport { client, endpoint }
+        JsonRpcTransport {
+            client,
+            endpoint,
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
+        }
+    }
+
+    /// Caps the response body this transport will buffer, in bytes.
+    ///
+    /// A larger body is refused with an error instead of being read into
+    /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
+    /// Streaming (SSE) responses are not buffered and are not subject to it.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
     }
 
     async fn call_value_with_payload(
@@ -71,9 +87,12 @@ impl JsonRpcTransport {
         // Read the body as text first so the raw bytes can be logged before
         // they become a typed value; one error message still covers both a
         // transport failure and a parse failure, as `json()` did.
-        let body = wire::response_text(response)
-            .await
-            .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
+        let body = wire::response_text(
+            response,
+            self.max_response_bytes,
+            "failed to parse JSON-RPC response",
+        )
+        .await?;
         let rpc_response: JsonRpcResponse = serde_json::from_str(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
 
@@ -163,9 +182,12 @@ impl JsonRpcTransport {
             let stream = response.bytes_stream();
             Ok(parse_sse_stream(stream))
         } else {
-            let body = wire::response_text(response).await.map_err(|e| {
-                A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
-            })?;
+            let body = wire::response_text(
+                response,
+                self.max_response_bytes,
+                "failed to parse JSON-RPC response",
+            )
+            .await?;
             let rpc_response: JsonRpcResponse = serde_json::from_str(&body).map_err(|e| {
                 A2AError::internal(format!("failed to parse JSON-RPC response: {e}"))
             })?;
@@ -526,9 +548,12 @@ impl Transport for JsonRpcTransport {
 
         let response = wire::send(&self.client, builder.json(&rpc_request)).await?;
 
-        let body = wire::response_text(response)
-            .await
-            .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
+        let body = wire::response_text(
+            response,
+            self.max_response_bytes,
+            "failed to parse JSON-RPC response",
+        )
+        .await?;
         let rpc_response: JsonRpcResponse = serde_json::from_str(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse JSON-RPC response: {e}")))?;
 
@@ -556,6 +581,7 @@ impl Transport for JsonRpcTransport {
 /// Factory for creating [`JsonRpcTransport`] instances.
 pub struct JsonRpcTransportFactory {
     client: Client,
+    max_response_bytes: usize,
 }
 
 impl JsonRpcTransportFactory {
@@ -563,7 +589,16 @@ impl JsonRpcTransportFactory {
         JsonRpcTransportFactory {
             client: client
                 .unwrap_or_else(|| crate::default_reqwest_client(None).expect("default client")),
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
         }
+    }
+
+    /// Caps the response body size of every transport this factory creates.
+    /// See [`JsonRpcTransport::with_max_response_bytes`].
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
     }
 
     #[cfg(any(
@@ -589,10 +624,10 @@ impl TransportFactory for JsonRpcTransportFactory {
         _card: &AgentCard,
         iface: &AgentInterface,
     ) -> Result<Box<dyn Transport>, A2AError> {
-        Ok(Box::new(JsonRpcTransport::new(
-            self.client.clone(),
-            iface.url.clone(),
-        )))
+        Ok(Box::new(
+            JsonRpcTransport::new(self.client.clone(), iface.url.clone())
+                .with_max_response_bytes(self.max_response_bytes),
+        ))
     }
 }
 
