@@ -57,7 +57,10 @@ impl RestTransport {
     ///
     /// A larger body is refused with an error instead of being read into
     /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
-    /// Streaming (SSE) responses are not buffered and are not subject to it.
+    /// On a streaming (SSE) call the same bound caps one buffered event: an
+    /// event larger than it ends the stream with an error naming the limit.
+    /// An error response whose body is over the cap, or cannot be read, still
+    /// reports its HTTP status, with an empty body.
     #[must_use]
     pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
         self.max_response_bytes = max_bytes;
@@ -103,17 +106,20 @@ impl RestTransport {
 
     async fn rest_error_from_response(&self, resp: reqwest::Response) -> A2AError {
         let status = resp.status();
-        let body = match wire::read_capped_text(
+        // The status is the one fact that is always known, so an error body
+        // that is over the cap or cannot be read is dropped, not reported in
+        // its place: the caller still gets the status-derived error, as it
+        // did before the cap existed.
+        let body = wire::read_capped_text(
             resp,
             self.max_response_bytes,
             "failed to read error response",
         )
         .await
-        {
-            Ok(body) => body,
-            // An oversized or unreadable error body is reported as such.
-            Err(read_error) => return read_error,
-        };
+        .unwrap_or_else(|read_error| {
+            tracing::debug!(error = %read_error, "error response body not used");
+            String::new()
+        });
         // A failing response is the one a person reaches for --debug to see,
         // so log it on the way to being turned into an error.
         wire::log_response(status, &body);
@@ -229,7 +235,10 @@ impl RestTransport {
         }
 
         let stream = resp.bytes_stream();
-        Ok(crate::jsonrpc::parse_sse_stream_rest(stream))
+        Ok(crate::jsonrpc::parse_sse_stream_rest_capped(
+            stream,
+            self.max_response_bytes,
+        ))
     }
 
     async fn get_streaming(
@@ -249,7 +258,10 @@ impl RestTransport {
         }
 
         let stream = resp.bytes_stream();
-        Ok(crate::jsonrpc::parse_sse_stream_rest(stream))
+        Ok(crate::jsonrpc::parse_sse_stream_rest_capped(
+            stream,
+            self.max_response_bytes,
+        ))
     }
 
     async fn delete(&self, path: &str, params: &ServiceParams) -> Result<(), A2AError> {
@@ -493,6 +505,7 @@ impl RestTransportFactory {
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
         Ok(Self {
             client: crate::default_reqwest_client(Some(pem))?,
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
         })
     }
 }

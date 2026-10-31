@@ -59,7 +59,8 @@ impl JsonRpcTransport {
     ///
     /// A larger body is refused with an error instead of being read into
     /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
-    /// Streaming (SSE) responses are not buffered and are not subject to it.
+    /// On a streaming (SSE) call the same bound caps one buffered event: an
+    /// event larger than it ends the stream with an error naming the limit.
     #[must_use]
     pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
         self.max_response_bytes = max_bytes;
@@ -180,7 +181,7 @@ impl JsonRpcTransport {
 
         if is_event_stream {
             let stream = response.bytes_stream();
-            Ok(parse_sse_stream(stream))
+            Ok(parse_sse_stream_capped(stream, self.max_response_bytes))
         } else {
             let body = wire::response_text(
                 response,
@@ -206,8 +207,19 @@ impl JsonRpcTransport {
 ///
 /// SSE line terminators per https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation:
 /// `\n\n`, `\r\r`, and `\r\n\r\n` are all valid event separators.
+#[cfg(test)]
 pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
-    for i in 0..buf.len().saturating_sub(1) {
+    find_event_boundary_from(buf, 0)
+}
+
+/// [`find_event_boundary`] starting the scan at `from`.
+///
+/// A caller that already scanned a prefix and found no boundary resumes
+/// `BOUNDARY_OVERLAP` bytes before its end (a boundary is at most four bytes
+/// and may straddle two chunks), so repeated scans cost O(new bytes) rather
+/// than O(buffer).
+pub(crate) fn find_event_boundary_from(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    for i in from..buf.len().saturating_sub(1) {
         if buf[i] == b'\n' && buf[i + 1] == b'\n' {
             return Some((i, i + 2));
         }
@@ -219,6 +231,15 @@ pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// How far before the end of an already-scanned buffer a resumed boundary
+/// scan starts: the longest boundary (`\r\n\r\n`) minus one byte.
+const BOUNDARY_OVERLAP: usize = 3;
+
+/// The error for a streamed event larger than the configured cap.
+fn sse_event_too_large(max_event_bytes: usize) -> A2AError {
+    crate::wire::response_too_large("SSE stream", max_event_bytes)
 }
 
 /// Interpret whatever is left in the buffer when the byte stream ends.
@@ -289,41 +310,73 @@ pub(crate) fn parse_stream_tail(
 ///
 /// `parse_event` is invoked on each complete `\n\n`/`\r\r`/`\r\n\r\n`-delimited
 /// event; it should return `Some(result)` to emit the event or `None` to skip it.
+///
+/// At most `max_event_bytes` of one event are buffered: an event that is larger,
+/// complete or not, ends the stream with an error naming the limit, so a peer
+/// that never sends an event boundary cannot grow client memory. The boundary
+/// scan resumes where the last one stopped, so its cost is linear in the bytes
+/// received.
 fn parse_sse_bytes<F>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     parse_event: F,
+    max_event_bytes: usize,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>>
 where
     F: Fn(&str) -> Option<Result<StreamResponse, A2AError>> + Clone + Send + 'static,
 {
+    struct SseState<S, F> {
+        stream: S,
+        buf: Vec<u8>,
+        /// Where the next boundary scan starts; no boundary lies before it.
+        scan_from: usize,
+        pending: VecDeque<Result<StreamResponse, A2AError>>,
+        parse_event: F,
+        /// Set once the stream is over (event over the cap): drain `pending`, then end.
+        finished: bool,
+    }
+
     let mapped = stream::unfold(
-        (
+        SseState {
             // Fused: after the tail is emitted the unfold polls once more,
             // and polling a stream after it has returned `None` is allowed
             // to panic.
-            Box::pin(stream.fuse()),
-            Vec::<u8>::new(),
-            VecDeque::new(),
+            stream: Box::pin(stream.fuse()),
+            buf: Vec::<u8>::new(),
+            scan_from: 0,
+            pending: VecDeque::new(),
             parse_event,
-        ),
-        |(mut stream, mut buf, mut pending, parse_event)| async move {
+            finished: false,
+        },
+        move |mut st| async move {
             loop {
                 // Drain already-parsed events before reading more bytes.
                 // Ensures all events from a single chunk are delivered before
                 // polling the stream again.
-                if let Some(item) = pending.pop_front() {
-                    return Some((item, (stream, buf, pending, parse_event)));
+                if let Some(item) = st.pending.pop_front() {
+                    return Some((item, st));
                 }
-                match stream.next().await {
+                if st.finished {
+                    return None;
+                }
+                match st.stream.next().await {
                     Some(Ok(chunk)) => {
                         // Keep the buffer as raw bytes; defer UTF-8 decoding to event boundaries.
-                        buf.extend_from_slice(&chunk);
-                        while let Some((start, end)) = find_event_boundary(&buf) {
-                            let event_bytes: Vec<u8> = buf.drain(..end).collect();
+                        st.buf.extend_from_slice(&chunk);
+                        while let Some((start, end)) =
+                            find_event_boundary_from(&st.buf, st.scan_from)
+                        {
+                            if start > max_event_bytes {
+                                st.pending
+                                    .push_back(Err(sse_event_too_large(max_event_bytes)));
+                                st.finished = true;
+                                break;
+                            }
+                            let event_bytes: Vec<u8> = st.buf.drain(..end).collect();
+                            st.scan_from = 0;
                             let event_text = match std::str::from_utf8(&event_bytes[..start]) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    pending.push_back(Err(A2AError::internal(format!(
+                                    st.pending.push_back(Err(A2AError::internal(format!(
                                         "SSE UTF-8 decode error: {e}"
                                     ))));
                                     continue;
@@ -335,21 +388,33 @@ where
                             // and REST streaming alike.
                             crate::wire::log_stream_event(event_text);
 
-                            if let Some(result) = parse_event(event_text) {
-                                pending.push_back(result);
+                            if let Some(result) = (st.parse_event)(event_text) {
+                                st.pending.push_back(result);
                             }
+                        }
+                        if st.finished {
+                            st.buf = Vec::new();
+                        } else if st.buf.len() > max_event_bytes {
+                            // No boundary yet and already over the cap: the
+                            // event can only get larger.
+                            st.pending
+                                .push_back(Err(sse_event_too_large(max_event_bytes)));
+                            st.finished = true;
+                            st.buf = Vec::new();
+                        } else {
+                            st.scan_from = st.buf.len().saturating_sub(BOUNDARY_OVERLAP);
                         }
                     }
                     Some(Err(e)) => {
-                        pending
+                        st.pending
                             .push_back(Err(A2AError::internal(format!("SSE stream error: {e}"))));
                     }
                     None => {
                         // End of stream: interpret the residual buffer
                         // rather than dropping it (#197).
-                        let tail = std::mem::take(&mut buf);
-                        return parse_stream_tail(&tail, &parse_event)
-                            .map(|item| (item, (stream, buf, pending, parse_event)));
+                        let tail = std::mem::take(&mut st.buf);
+                        st.finished = true;
+                        return parse_stream_tail(&tail, &st.parse_event).map(|item| (item, st));
                     }
                 }
             }
@@ -359,86 +424,116 @@ where
     Box::pin(mapped)
 }
 
-/// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope).
-fn parse_sse_stream(
+/// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope),
+/// buffering at most `max_event_bytes` of one event.
+fn parse_sse_stream_capped(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    max_event_bytes: usize,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    parse_sse_bytes(stream, |event_text| {
-        // Extract `data:` lines from the SSE event
-        let mut data = String::new();
-        for line in event_text.lines() {
-            if let Some(d) = line.strip_prefix("data: ") {
-                if !data.is_empty() {
-                    data.push('\n');
+    parse_sse_bytes(
+        stream,
+        |event_text| {
+            // Extract `data:` lines from the SSE event
+            let mut data = String::new();
+            for line in event_text.lines() {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
+                } else if let Some(d) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
                 }
-                data.push_str(d);
-            } else if let Some(d) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
             }
-        }
-        if data.is_empty() {
-            return None;
-        }
+            if data.is_empty() {
+                return None;
+            }
 
-        // Try JSON-RPC envelope first
-        match serde_json::from_str::<JsonRpcResponse>(&data) {
-            Ok(rpc_resp) => {
-                if let Some(err) = rpc_resp.error {
-                    return Some(Err(parse_jsonrpc_error(err)));
+            // Try JSON-RPC envelope first
+            match serde_json::from_str::<JsonRpcResponse>(&data) {
+                Ok(rpc_resp) => {
+                    if let Some(err) = rpc_resp.error {
+                        return Some(Err(parse_jsonrpc_error(err)));
+                    }
+                    if let Some(result) = rpc_resp.result {
+                        match protojson_conv::from_value::<StreamResponse>(result) {
+                            Ok(sr) => Some(Ok(sr)),
+                            Err(e) => {
+                                Some(Err(A2AError::internal(format!("SSE parse error: {e}"))))
+                            }
+                        }
+                    } else {
+                        None
+                    }
                 }
-                if let Some(result) = rpc_resp.result {
-                    match protojson_conv::from_value::<StreamResponse>(result) {
+                Err(_) => {
+                    // Fallback: parse directly as StreamResponse
+                    match protojson_conv::from_str::<StreamResponse>(&data) {
                         Ok(sr) => Some(Ok(sr)),
                         Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
                     }
-                } else {
-                    None
                 }
             }
-            Err(_) => {
-                // Fallback: parse directly as StreamResponse
-                match protojson_conv::from_str::<StreamResponse>(&data) {
-                    Ok(sr) => Some(Ok(sr)),
-                    Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
-                }
-            }
-        }
-    })
+        },
+        max_event_bytes,
+    )
 }
 
 /// Parse an SSE byte stream into StreamResponse events (REST binding).
 /// Unlike the JSON-RPC variant, this expects data lines to contain
 /// raw StreamResponse JSON (not wrapped in a JSON-RPC envelope).
+/// Buffers at most `max_event_bytes` of one event.
+pub(crate) fn parse_sse_stream_rest_capped(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    max_event_bytes: usize,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    parse_sse_bytes(
+        stream,
+        |event_text| {
+            let mut data = String::new();
+            for line in event_text.lines() {
+                if let Some(d) = line.strip_prefix("data: ") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
+                } else if let Some(d) = line.strip_prefix("data:") {
+                    if !data.is_empty() {
+                        data.push('\n');
+                    }
+                    data.push_str(d);
+                }
+            }
+            if data.is_empty() {
+                return None;
+            }
+
+            match protojson_conv::from_str::<StreamResponse>(&data) {
+                Ok(sr) => Some(Ok(sr)),
+                Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
+            }
+        },
+        max_event_bytes,
+    )
+}
+
+/// Test shorthand: the JSON-RPC parser with the default cap.
+#[cfg(test)]
+fn parse_sse_stream(
+    stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    parse_sse_stream_capped(stream, crate::DEFAULT_MAX_RESPONSE_BODY_BYTES)
+}
+
+/// Test shorthand: the REST parser with the default cap.
+#[cfg(test)]
 pub(crate) fn parse_sse_stream_rest(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
-    parse_sse_bytes(stream, |event_text| {
-        let mut data = String::new();
-        for line in event_text.lines() {
-            if let Some(d) = line.strip_prefix("data: ") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            } else if let Some(d) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(d);
-            }
-        }
-        if data.is_empty() {
-            return None;
-        }
-
-        match protojson_conv::from_str::<StreamResponse>(&data) {
-            Ok(sr) => Some(Ok(sr)),
-            Err(e) => Some(Err(A2AError::internal(format!("SSE parse error: {e}")))),
-        }
-    })
+    parse_sse_stream_rest_capped(stream, crate::DEFAULT_MAX_RESPONSE_BODY_BYTES)
 }
 
 #[async_trait]
@@ -609,6 +704,7 @@ impl JsonRpcTransportFactory {
     pub fn with_root_certificates_pem(pem: &[u8]) -> Result<Self, A2AError> {
         Ok(Self {
             client: crate::default_reqwest_client(Some(pem))?,
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
         })
     }
 }
@@ -2012,5 +2108,132 @@ mod tests {
 
         assert_eq!(items.len(), 1, "expected one item, got {items:?}");
         assert!(items.into_iter().next().unwrap().is_err());
+    }
+
+    // ---- the per-event cap on the SSE buffer ----
+
+    fn status_event_data() -> String {
+        let sr = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t1".into(),
+            context_id: "c1".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        serde_json::to_string(&protojson_conv::to_value(&sr).unwrap()).unwrap()
+    }
+
+    /// A stream that never emits an event boundary and is far larger than the
+    /// cap ends with the named error instead of being buffered to its end.
+    #[tokio::test]
+    async fn test_sse_stream_without_boundary_over_cap_ends_with_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cap = 4096;
+        let polled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&polled);
+        let chunks: Vec<String> = (0..64).map(|_| "x".repeat(1024)).collect();
+        let counted = byte_stream(chunks).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let items: Vec<_> = parse_sse_stream_rest_capped(counted, cap).collect().await;
+
+        assert_eq!(items.len(), 1, "expected only the error, got {items:?}");
+        let error = items.into_iter().next().unwrap().unwrap_err();
+        assert!(error.message.contains("exceeds"), "{}", error.message);
+        assert!(error.message.contains("4096"), "{}", error.message);
+        assert!(error.message.contains("SSE stream"), "{}", error.message);
+        // The read stopped at the cap: 4 KiB is reached on the fifth chunk.
+        assert!(
+            polled.load(Ordering::SeqCst) <= 6,
+            "the stream was read past the cap: {} chunks",
+            polled.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Same for the JSON-RPC binding's parser.
+    #[tokio::test]
+    async fn test_sse_stream_jsonrpc_without_boundary_over_cap_ends_with_error() {
+        let chunks: Vec<String> = (0..16)
+            .map(|_| "data: xxxxxxxxxxxxxxx".to_string())
+            .collect();
+        let items: Vec<_> = parse_sse_stream_capped(byte_stream(chunks), 64)
+            .collect()
+            .await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].as_ref().unwrap_err().message.contains("exceeds"));
+    }
+
+    /// A complete event larger than the cap is refused too, even when one
+    /// chunk carries the whole of it and its boundary.
+    #[tokio::test]
+    async fn test_sse_complete_event_over_cap_is_refused() {
+        let event = format!("data: {}\n\n", "y".repeat(8192));
+        let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(vec![event]), 1024)
+            .collect()
+            .await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].as_ref().unwrap_err().message.contains("exceeds"));
+    }
+
+    /// Events delivered before the oversized one still reach the caller, and
+    /// nothing follows the error.
+    #[tokio::test]
+    async fn test_sse_events_before_an_oversized_event_are_delivered() {
+        let good = format!("data: {}\n\n", status_event_data());
+        let big = format!("data: {}", "z".repeat(8192));
+        let after = format!("data: {}\n\n", status_event_data());
+        let cap = good.len() + 64;
+        let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(vec![good, big, after]), cap)
+            .collect()
+            .await;
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items[0].is_ok());
+        assert!(items[1].as_ref().unwrap_err().message.contains("exceeds"));
+    }
+
+    /// Events under the cap keep working when a boundary is split across
+    /// chunks, which the resumed scan must still find.
+    #[tokio::test]
+    async fn test_sse_boundary_split_across_chunks_under_cap() {
+        for split in 1..4 {
+            let sep = "\r\n\r\n";
+            let event = format!("data: {}{sep}", status_event_data());
+            let cut = event.len() - split;
+            let chunks = vec![event[..cut].to_string(), event[cut..].to_string()];
+            let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), 4096)
+                .collect()
+                .await;
+            assert_eq!(items.len(), 1, "split {split}: {items:?}");
+            assert!(items[0].is_ok(), "split {split}: {items:?}");
+        }
+    }
+
+    /// Resuming the scan `BOUNDARY_OVERLAP` bytes before the end of a prefix
+    /// that held no boundary finds exactly what a full scan finds.
+    #[test]
+    fn test_find_event_boundary_from_matches_a_full_scan() {
+        let inputs: [&[u8]; 5] = [
+            b"data: a\n\ndata: b\n\n",
+            b"data: a\r\n\r\ndata: b",
+            b"data: a\r\rdata: b\r\r",
+            b"x\r\n\r\n",
+            b"no boundary at all",
+        ];
+        for input in inputs {
+            let full = find_event_boundary(input);
+            for k in 0..=input.len() {
+                if find_event_boundary(&input[..k]).is_some() {
+                    continue;
+                }
+                let resumed = find_event_boundary_from(input, k.saturating_sub(BOUNDARY_OVERLAP));
+                assert_eq!(resumed, full, "input {input:?} resumed at {k}");
+            }
+        }
     }
 }

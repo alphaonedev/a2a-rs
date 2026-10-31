@@ -51,13 +51,15 @@ impl AgentCardResolver {
             )));
         }
 
-        let body = crate::wire::read_capped_text(
+        // Bytes, not text: invalid UTF-8 in a card is rejected by the JSON
+        // parser, as `Response::json` did, rather than patched with U+FFFD.
+        let body = crate::wire::read_capped_bytes(
             resp,
             self.max_response_bytes,
             "failed to parse agent card",
         )
         .await?;
-        serde_json::from_str::<AgentCard>(&body)
+        serde_json::from_slice::<AgentCard>(&body)
             .map_err(|e| A2AError::internal(format!("failed to parse agent card: {e}")))
     }
 }

@@ -155,6 +155,8 @@ pub struct A2AClientFactoryBuilder {
     preferred_bindings: Vec<String>,
     interceptors: Vec<Arc<dyn CallInterceptor>>,
     include_defaults: bool,
+    max_response_bytes: usize,
+    read_timeout: Option<std::time::Duration>,
 }
 
 impl A2AClientFactoryBuilder {
@@ -167,6 +169,8 @@ impl A2AClientFactoryBuilder {
             ],
             interceptors: Vec::new(),
             include_defaults: true,
+            max_response_bytes: crate::DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            read_timeout: None,
         }
     }
 
@@ -195,18 +199,57 @@ impl A2AClientFactoryBuilder {
         self
     }
 
+    /// Caps the response body, and one streamed event, of the default
+    /// JSON-RPC and REST transports this builder creates.
+    ///
+    /// Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
+    /// A factory added with [`Self::register`] keeps its own setting, so call
+    /// its `with_max_response_bytes` before registering it.
+    #[must_use]
+    pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_bytes = max_bytes;
+        self
+    }
+
+    /// Sets the read timeout of the HTTP client behind the default JSON-RPC and
+    /// REST transports this builder creates.
+    ///
+    /// Unset by default. See [`default_reqwest_client_with_read_timeout`](crate::default_reqwest_client_with_read_timeout)
+    /// for what the timeout covers. A factory added with [`Self::register`]
+    /// keeps its own client.
+    #[must_use]
+    pub fn with_read_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
     /// Build the factory.
     pub fn build(mut self) -> A2AClientFactory {
         if self.include_defaults {
+            let max_bytes = self.max_response_bytes;
+            let read_timeout = self.read_timeout;
+            // The same construction, and the same failure mode, as the
+            // `new(None)` default client.
+            let default_client = || {
+                crate::default_reqwest_client_with_read_timeout(None, read_timeout)
+                    .expect("default client")
+            };
+
             let jsonrpc_key = TransportKey::from_protocol(TRANSPORT_PROTOCOL_JSONRPC, VERSION);
-            self.factories
-                .entry(jsonrpc_key)
-                .or_insert_with(|| Arc::new(JsonRpcTransportFactory::new(None)));
+            self.factories.entry(jsonrpc_key).or_insert_with(|| {
+                Arc::new(
+                    JsonRpcTransportFactory::new(Some(default_client()))
+                        .with_max_response_bytes(max_bytes),
+                )
+            });
 
             let rest_key = TransportKey::from_protocol(TRANSPORT_PROTOCOL_HTTP_JSON, VERSION);
-            self.factories
-                .entry(rest_key)
-                .or_insert_with(|| Arc::new(RestTransportFactory::new(None)));
+            self.factories.entry(rest_key).or_insert_with(|| {
+                Arc::new(
+                    RestTransportFactory::new(Some(default_client()))
+                        .with_max_response_bytes(max_bytes),
+                )
+            });
         }
 
         A2AClientFactory {

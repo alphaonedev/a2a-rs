@@ -42,10 +42,31 @@ pub use rustls;
 
 /// Build a `reqwest::Client` whose TLS layer matches this crate's feature
 /// selection, optionally adding extra root certificates from a PEM bundle.
+///
+/// Sets no read timeout; see [`default_reqwest_client_with_read_timeout`].
 pub fn default_reqwest_client(
+    extra_root_pem: Option<&[u8]>,
+) -> Result<reqwest::Client, a2a::A2AError> {
+    default_reqwest_client_with_read_timeout(extra_root_pem, None)
+}
+
+/// [`default_reqwest_client`] with an optional read timeout.
+///
+/// `read_timeout` bounds the wait for each read of a response, headers and
+/// every body chunk, not the whole call, so a peer that stalls or drips bytes
+/// slower than that ends the call with an error. It is `None` by default so a
+/// quiet Server-Sent Events stream is not cut: pick a value longer than the
+/// longest gap the agent leaves between stream events. The response size cap
+/// bounds memory; this bounds time.
+pub fn default_reqwest_client_with_read_timeout(
     #[allow(unused_variables)] extra_root_pem: Option<&[u8]>,
+    read_timeout: Option<std::time::Duration>,
 ) -> Result<reqwest::Client, a2a::A2AError> {
     let builder = reqwest::Client::builder();
+    let builder = match read_timeout {
+        Some(timeout) => builder.read_timeout(timeout),
+        None => builder,
+    };
 
     #[cfg(any(
         feature = "rustls-tls",

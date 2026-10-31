@@ -117,46 +117,79 @@ pub(crate) async fn response_text(
 ///
 /// Sized like the server's request body limit (`MAX_REQUEST_BODY_BYTES`,
 /// 10 MiB), so a peer is held to the same bound in both directions. Override
-/// it per transport with `with_max_response_bytes`.
+/// it per transport with `with_max_response_bytes`. The same bound caps one
+/// buffered Server-Sent Events event on a streaming call.
 pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-fn response_too_large(max_bytes: usize) -> A2AError {
-    A2AError::internal(format!("response body exceeds the {max_bytes} byte limit"))
+/// The error for a body or event that crossed the cap; `context` names the
+/// caller so the message says which read was refused.
+pub(crate) fn response_too_large(context: &str, max_bytes: usize) -> A2AError {
+    A2AError::internal(format!(
+        "{context}: response body exceeds the {max_bytes} byte limit"
+    ))
 }
 
-/// Reads a response body into a string without ever holding more than
-/// `max_bytes` of it.
+/// The UTF-8 byte order mark. `reqwest::Response::text` strips it while
+/// decoding, so the capped reader does too.
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Reads a response body into bytes, never buffering more than `max_bytes`.
 ///
 /// A declared `Content-Length` over the cap is refused before any body byte
-/// is read; a body that is chunked, or that lies about its length, is counted
-/// as it streams and abandoned the moment it crosses the cap. `context`
-/// prefixes a transport read failure, so each caller keeps its own message.
-pub(crate) async fn read_capped_text(
+/// is read. A body without one (chunked, or delimited by closing the
+/// connection) is counted as it streams and abandoned the moment it crosses
+/// the cap; a body that disagrees with its declared length is a transport
+/// error from the HTTP layer, not a way past the cap. The buffer is sized from
+/// the declared length (bounded by the cap) and grows by doubling but never
+/// past the cap, so the transient peak stays at the cap plus allocator
+/// rounding. One leading UTF-8 byte order mark is removed. `context` prefixes
+/// a transport read failure and the over-cap error, so each caller keeps its
+/// own message.
+pub(crate) async fn read_capped_bytes(
     mut resp: reqwest::Response,
     max_bytes: usize,
     context: &str,
-) -> Result<String, A2AError> {
-    if resp
-        .content_length()
-        .is_some_and(|declared| declared > max_bytes as u64)
-    {
-        return Err(response_too_large(max_bytes));
+) -> Result<Vec<u8>, A2AError> {
+    let declared = resp.content_length();
+    if declared.is_some_and(|declared| u64::try_from(max_bytes).is_ok_and(|cap| declared > cap)) {
+        return Err(response_too_large(context, max_bytes));
     }
 
-    let mut body: Vec<u8> = Vec::new();
+    let initial = declared.map_or(0, |n| usize::try_from(n).unwrap_or(max_bytes));
+    let mut body: Vec<u8> = Vec::with_capacity(initial.min(max_bytes));
     while let Some(chunk) = resp
         .chunk()
         .await
         .map_err(|e| A2AError::internal(format!("{context}: {e}")))?
     {
-        if body.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(response_too_large(max_bytes));
+        let needed = body.len().saturating_add(chunk.len());
+        if needed > max_bytes {
+            return Err(response_too_large(context, max_bytes));
+        }
+        if needed > body.capacity() {
+            // Doubling, clamped to the cap, so `Vec`'s own growth cannot
+            // reserve past the bound.
+            let target = needed.max(body.capacity().saturating_mul(2)).min(max_bytes);
+            body.reserve_exact(target - body.len());
         }
         body.extend_from_slice(&chunk);
     }
 
-    // A2A bodies are UTF-8 JSON; `text()` would also honour a declared
-    // charset, which only matters for a peer that is not speaking A2A.
+    if body.starts_with(&UTF8_BOM) {
+        body.drain(..UTF8_BOM.len());
+    }
+    Ok(body)
+}
+
+/// Reads a capped response body to text, decoding invalid UTF-8 lossily as
+/// `Response::text` does; used where the base behaviour is to tolerate it.
+/// A caller that must reject invalid UTF-8 uses [`read_capped_bytes`].
+pub(crate) async fn read_capped_text(
+    resp: reqwest::Response,
+    max_bytes: usize,
+    context: &str,
+) -> Result<String, A2AError> {
+    let body = read_capped_bytes(resp, max_bytes, context).await?;
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
