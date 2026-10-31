@@ -1563,7 +1563,14 @@ mod tests {
         let json = distinct.into_iter().next().unwrap();
         let params_at = json.find("\"params\":").expect("params serialized");
         let header_at = json.find("\"header\":").expect("header serialized");
-        assert_keys_in_order(&json[params_at..], &SIX_KEYS_SORTED);
-        assert_keys_in_order(&json[header_at..], &SIX_KEYS_SORTED);
+        // Each key scan stops where the other map begins, so an unsorted map
+        // cannot be hidden by the keys of the next one.
+        let (params_end, header_end) = if params_at < header_at {
+            (header_at, json.len())
+        } else {
+            (json.len(), params_at)
+        };
+        assert_keys_in_order(&json[params_at..params_end], &SIX_KEYS_SORTED);
+        assert_keys_in_order(&json[header_at..header_end], &SIX_KEYS_SORTED);
     }
 }
