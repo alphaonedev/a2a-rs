@@ -59,8 +59,9 @@ impl JsonRpcTransport {
     ///
     /// A larger body is refused with an error instead of being read into
     /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
-    /// On a streaming (SSE) call the same bound caps one buffered event: an
-    /// event larger than it ends the stream with an error naming the limit.
+    /// On a streaming (SSE) call the same bound caps one event: an event larger
+    /// than it ends the stream with an error naming the limit (the buffer holds
+    /// at most the cap plus one transport chunk).
     #[must_use]
     pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
         self.max_response_bytes = max_bytes;
@@ -311,11 +312,13 @@ pub(crate) fn parse_stream_tail(
 /// `parse_event` is invoked on each complete `\n\n`/`\r\r`/`\r\n\r\n`-delimited
 /// event; it should return `Some(result)` to emit the event or `None` to skip it.
 ///
-/// At most `max_event_bytes` of one event are buffered: an event that is larger,
-/// complete or not, ends the stream with an error naming the limit, so a peer
-/// that never sends an event boundary cannot grow client memory. The boundary
-/// scan resumes where the last one stopped, so its cost is linear in the bytes
-/// received.
+/// An event is refused once its buffered bytes exceed `max_event_bytes`: an
+/// event that is larger, complete or not, ends the stream with an error naming
+/// the limit, so a peer that never sends an event boundary cannot grow client
+/// memory. The buffer holds at most the cap plus one transport chunk. The
+/// boundary scan resumes where the last one stopped and events are sliced out
+/// of the buffer in place (the consumed prefix is dropped once per chunk), so
+/// the total cost is linear in the bytes received.
 fn parse_sse_bytes<F>(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     parse_event: F,
@@ -362,18 +365,22 @@ where
                     Some(Ok(chunk)) => {
                         // Keep the buffer as raw bytes; defer UTF-8 decoding to event boundaries.
                         st.buf.extend_from_slice(&chunk);
-                        while let Some((start, end)) =
-                            find_event_boundary_from(&st.buf, st.scan_from)
-                        {
-                            if start > max_event_bytes {
+                        // Events are sliced out of the buffer in place and the
+                        // consumed prefix is dropped once, after the loop, so a
+                        // read carrying many tiny events costs O(read size).
+                        let mut consumed = 0usize;
+                        let mut scan = st.scan_from;
+                        while let Some((start, end)) = find_event_boundary_from(&st.buf, scan) {
+                            if start - consumed > max_event_bytes {
                                 st.pending
                                     .push_back(Err(sse_event_too_large(max_event_bytes)));
                                 st.finished = true;
                                 break;
                             }
-                            let event_bytes: Vec<u8> = st.buf.drain(..end).collect();
-                            st.scan_from = 0;
-                            let event_text = match std::str::from_utf8(&event_bytes[..start]) {
+                            let event_range = consumed..start;
+                            consumed = end;
+                            scan = end;
+                            let event_text = match std::str::from_utf8(&st.buf[event_range]) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     st.pending.push_back(Err(A2AError::internal(format!(
@@ -394,15 +401,21 @@ where
                         }
                         if st.finished {
                             st.buf = Vec::new();
-                        } else if st.buf.len() > max_event_bytes {
-                            // No boundary yet and already over the cap: the
-                            // event can only get larger.
-                            st.pending
-                                .push_back(Err(sse_event_too_large(max_event_bytes)));
-                            st.finished = true;
-                            st.buf = Vec::new();
                         } else {
-                            st.scan_from = st.buf.len().saturating_sub(BOUNDARY_OVERLAP);
+                            st.buf.drain(..consumed);
+                            // A boundary is at most four bytes and may
+                            // straddle two chunks, so a pending partial one
+                            // is allowed to sit past the cap.
+                            if st.buf.len() > max_event_bytes.saturating_add(BOUNDARY_OVERLAP) {
+                                // No boundary yet and already over the cap:
+                                // the event can only get larger.
+                                st.pending
+                                    .push_back(Err(sse_event_too_large(max_event_bytes)));
+                                st.finished = true;
+                                st.buf = Vec::new();
+                            } else {
+                                st.scan_from = st.buf.len().saturating_sub(BOUNDARY_OVERLAP);
+                            }
                         }
                     }
                     Some(Err(e)) => {
@@ -425,7 +438,8 @@ where
 }
 
 /// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope),
-/// buffering at most `max_event_bytes` of one event.
+/// refusing an event once its buffered bytes exceed `max_event_bytes` (the
+/// buffer holds at most the cap plus one transport chunk).
 fn parse_sse_stream_capped(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     max_event_bytes: usize,
@@ -485,7 +499,8 @@ fn parse_sse_stream_capped(
 /// Parse an SSE byte stream into StreamResponse events (REST binding).
 /// Unlike the JSON-RPC variant, this expects data lines to contain
 /// raw StreamResponse JSON (not wrapped in a JSON-RPC envelope).
-/// Buffers at most `max_event_bytes` of one event.
+/// An event is refused once its buffered bytes exceed `max_event_bytes` (the
+/// buffer holds at most the cap plus one transport chunk).
 pub(crate) fn parse_sse_stream_rest_capped(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     max_event_bytes: usize,
@@ -2198,20 +2213,130 @@ mod tests {
     }
 
     /// Events under the cap keep working when a boundary is split across
-    /// chunks, which the resumed scan must still find.
+    /// chunks: a second complete event follows the split, so only a resumed
+    /// scan that overlaps the previous end finds the first boundary before
+    /// the second one hides it.
     #[tokio::test]
     async fn test_sse_boundary_split_across_chunks_under_cap() {
-        for split in 1..4 {
-            let sep = "\r\n\r\n";
-            let event = format!("data: {}{sep}", status_event_data());
-            let cut = event.len() - split;
-            let chunks = vec![event[..cut].to_string(), event[cut..].to_string()];
-            let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), 4096)
-                .collect()
-                .await;
-            assert_eq!(items.len(), 1, "split {split}: {items:?}");
-            assert!(items[0].is_ok(), "split {split}: {items:?}");
+        for sep in ["\r\n\r\n", "\n\n", "\r\r"] {
+            for split in 1..sep.len() {
+                let event = format!("data: {}{sep}", status_event_data());
+                let cut = event.len() - split;
+                let chunks = vec![
+                    event[..cut].to_string(),
+                    format!("{}{event}", &event[cut..]),
+                ];
+                let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), 4096)
+                    .collect()
+                    .await;
+                assert_eq!(items.len(), 2, "sep {sep:?} split {split}: {items:?}");
+                assert!(
+                    items.iter().all(Result::is_ok),
+                    "sep {sep:?} split {split}: {items:?}"
+                );
+            }
         }
+    }
+
+    /// An event of exactly the cap is accepted however its terminator is
+    /// chunked, and one byte more is refused however it is chunked.
+    #[tokio::test]
+    async fn test_sse_event_at_the_cap_is_accepted_whatever_the_chunking() {
+        let data = status_event_data();
+        let body = format!("data: {data}");
+        let cap = body.len();
+        for sep in ["\r\n\r\n", "\n\n", "\r\r"] {
+            for split in 1..=sep.len() {
+                let (head, tail) = sep.split_at(sep.len() - split);
+                let chunks = vec![format!("{body}{head}"), tail.to_string()];
+                let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), cap)
+                    .collect()
+                    .await;
+                assert_eq!(items.len(), 1, "sep {sep:?} split {split}: {items:?}");
+                assert!(items[0].is_ok(), "sep {sep:?} split {split}: {items:?}");
+
+                let over = format!("{body} ");
+                let chunks = vec![format!("{over}{head}"), tail.to_string()];
+                let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), cap)
+                    .collect()
+                    .await;
+                assert_eq!(items.len(), 1, "sep {sep:?} split {split}: {items:?}");
+                assert!(
+                    items[0].as_ref().unwrap_err().message.contains("exceeds"),
+                    "sep {sep:?} split {split}: {items:?}"
+                );
+            }
+        }
+    }
+
+    /// A 1 MiB stream of minimal events, delivered as large reads the way a
+    /// fast peer does, is parsed in time linear in its size: the event count
+    /// is exact and the wall clock stays under a bound that is generous for
+    /// linear work (a few ms in release) but not for the old per-event
+    /// buffer shift (quadratic within a read).
+    #[tokio::test]
+    async fn test_sse_one_mib_of_tiny_events_parses_in_linear_time() {
+        const TOTAL: usize = 1024 * 1024;
+        const READ: usize = 256 * 1024;
+        const WALL_CLOCK_BOUND_SECS: u64 = 3;
+        let event = format!(
+            "data: {}\n\n",
+            r#"{"statusUpdate":{"taskId":"t","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}}"#
+        );
+        let count = TOTAL / event.len();
+        let all = event.repeat(count);
+        let chunks: Vec<String> = all
+            .as_bytes()
+            .chunks(READ)
+            .map(|c| String::from_utf8(c.to_vec()).unwrap())
+            .collect();
+
+        let started = std::time::Instant::now();
+        let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), 64 * 1024)
+            .collect()
+            .await;
+        let elapsed = started.elapsed();
+        eprintln!("tiny-events: {count} events, {elapsed:?}");
+
+        assert_eq!(items.len(), count);
+        assert!(items.iter().all(Result::is_ok));
+        assert!(
+            elapsed < std::time::Duration::from_secs(WALL_CLOCK_BOUND_SECS),
+            "parsing {count} events took {elapsed:?}"
+        );
+    }
+
+    /// Hostile variant: 1 MiB of minimal (empty) events in one read. Every
+    /// event reaches the parse callback exactly once, nothing is delivered,
+    /// and the wall clock stays under a bound that is generous for linear
+    /// work (milliseconds in release) but far below the quadratic cost of
+    /// the old per-event buffer shift (tens of seconds in a debug build).
+    #[tokio::test]
+    async fn test_sse_one_mib_of_minimal_events_is_counted_in_linear_time() {
+        const WALL_CLOCK_BOUND_SECS: u64 = 5;
+        const EVENTS: usize = 512 * 1024;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&seen);
+        let body = "\n\n".repeat(EVENTS);
+        let started = std::time::Instant::now();
+        let items: Vec<_> = parse_sse_bytes(
+            byte_stream(vec![body]),
+            move |_event| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+            64 * 1024,
+        )
+        .collect()
+        .await;
+        let elapsed = started.elapsed();
+        eprintln!("empty-events: {elapsed:?}");
+        assert!(items.is_empty(), "{} items", items.len());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), EVENTS);
+        assert!(
+            elapsed < std::time::Duration::from_secs(WALL_CLOCK_BOUND_SECS),
+            "parsing {EVENTS} events took {elapsed:?}"
+        );
     }
 
     /// Resuming the scan `BOUNDARY_OVERLAP` bytes before the end of a prefix

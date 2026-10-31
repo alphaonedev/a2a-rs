@@ -224,6 +224,12 @@ impl A2AClientFactoryBuilder {
     }
 
     /// Build the factory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default HTTP client cannot be built (reqwest failing to
+    /// initialise with no extra TLS roots), the same failure mode as the
+    /// `new(None)` constructors of the transports and the card resolver.
     pub fn build(mut self) -> A2AClientFactory {
         if self.include_defaults {
             let max_bytes = self.max_response_bytes;

@@ -510,7 +510,35 @@ async fn read_timeout_ends_a_stalled_response() {
     );
 }
 
+/// The default is 10 MiB, the same bound as the server's request cap
+/// (`MAX_REQUEST_BODY_BYTES` in `a2a-server/src/jsonrpc.rs`; `a2a-client` does
+/// not depend on `a2a-server`, so the value is pinned here, not read).
 #[test]
-fn default_cap_matches_the_server_request_cap() {
+fn default_cap_is_ten_mib() {
     assert_eq!(DEFAULT_MAX_RESPONSE_BODY_BYTES, 10 * 1024 * 1024);
+}
+
+/// A body that disagrees with its `Content-Length` is never counted against
+/// the cap: the HTTP layer enforces the declared framing, so a longer body is
+/// cut at the declared length and a shorter one fails to read. Either way the
+/// client errors out without crossing the cap and without reading the excess.
+#[tokio::test]
+async fn body_that_disagrees_with_its_content_length_is_not_counted_against_the_cap() {
+    // Understated: declares 64 bytes, then sends 64 KiB (far over the cap).
+    let endpoint = serve_truncated("200 OK", 64, padded_body(SMALL_CAP * 64)).await;
+    let err = jsonrpc(endpoint)
+        .get_task(&ServiceParams::new(), &get_task_request())
+        .await
+        .expect_err("a body cut at its declared length is not a valid response");
+    let text = err.to_string();
+    assert!(!text.contains("exceeds"), "{text}");
+
+    // Overstated: declares 512 bytes (under the cap), sends 40 and closes.
+    let endpoint = serve_truncated("200 OK", SMALL_CAP / 2, padded_body(40)).await;
+    let err = jsonrpc(endpoint)
+        .get_task(&ServiceParams::new(), &get_task_request())
+        .await
+        .expect_err("a body shorter than its declared length fails to read");
+    let text = err.to_string();
+    assert!(!text.contains("exceeds"), "{text}");
 }

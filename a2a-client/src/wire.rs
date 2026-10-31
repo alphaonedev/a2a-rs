@@ -138,8 +138,10 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// A declared `Content-Length` over the cap is refused before any body byte
 /// is read. A body without one (chunked, or delimited by closing the
 /// connection) is counted as it streams and abandoned the moment it crosses
-/// the cap; a body that disagrees with its declared length is a transport
-/// error from the HTTP layer, not a way past the cap. The buffer is sized from
+/// the cap. A body that disagrees with its declared length cannot pass the cap
+/// either: the HTTP layer enforces the framing, so a longer body is cut to the
+/// declared length and a shorter one fails to read, and neither is counted
+/// against the cap. The buffer is sized from
 /// the declared length (bounded by the cap) and grows by doubling but never
 /// past the cap, so the transient peak stays at the cap plus allocator
 /// rounding. One leading UTF-8 byte order mark is removed. `context` prefixes
