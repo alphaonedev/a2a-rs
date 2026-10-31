@@ -107,9 +107,12 @@ where
     }
 }
 
-// `BTreeMap` so the scheme names serialize in a stable (sorted) order.
+// `BTreeMap` so the scheme names serialize in a stable (sorted) order. An
+// empty requirement serializes as `{}`: ProtoJSON omits an empty map, and the
+// reader below accepts `{}` as well as `{"schemes": {}}`.
 #[derive(Serialize)]
 struct SerializedSecurityRequirement<'a> {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     schemes: BTreeMap<&'a str, SerializedSecurityScopes<'a>>,
 }
 
@@ -126,7 +129,12 @@ struct SerializedSecurityScopes<'a> {
 /// Public map fields stay `HashMap` (so constructing them is unchanged), but
 /// `HashMap` iteration order differs per process, which would make the
 /// serialized card byte-unstable. Sorting here keeps the output deterministic
-/// for diffing, caching and signing.
+/// for diffing and caching.
+///
+/// This is not RFC 8785 (JCS) canonicalization: `BTreeMap` orders keys by
+/// code point, while JCS orders them by UTF-16 code unit, and the two differ for
+/// keys that mix U+E000..U+FFFF with supplementary-plane characters. A signer
+/// must still canonicalize the card with RFC 8785 (A2A section 8.4.1).
 fn sorted_map<K, V, H, S>(map: &HashMap<K, V, H>, serializer: S) -> Result<S::Ok, S::Error>
 where
     K: Ord + Serialize,
@@ -359,6 +367,9 @@ pub struct AgentExtension {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
 
+    /// Extension parameters. The top-level keys serialize in sorted order;
+    /// nested JSON values are written as they are held and are not
+    /// canonicalized.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -649,6 +660,9 @@ pub type SecurityRequirement = HashMap<String, Vec<String>>;
 pub struct AgentCardSignature {
     pub protected: String,
     pub signature: String,
+    /// The JWS unprotected header. The top-level keys serialize in sorted
+    /// order; nested JSON values are written as they are held and are not
+    /// canonicalized.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1305,5 +1319,251 @@ mod tests {
             let back: AgentCard = serde_json::from_str(&again).unwrap();
             assert_eq!(back, card, "shape {shape}");
         }
+    }
+
+    /// A card carrying `securityRequirements` in the given input shape.
+    fn card_with_requirements(shape: &str) -> AgentCard {
+        let json = format!(
+            r#"{{"name":"n","version":"1","supportedInterfaces":[],"capabilities":{{}},"securityRequirements":{shape}}}"#
+        );
+        serde_json::from_str(&json).unwrap_or_else(|e| panic!("shape {shape}: {e}"))
+    }
+
+    /// Edge shapes of #361: each parses, serializes to the canonical form,
+    /// parses back equal, and serializes again byte for byte.
+    #[test]
+    fn security_requirement_edge_cases_round_trip() {
+        for (shape, canonical) in [
+            // A scheme literally named `schemes`.
+            (
+                r#"[{"schemes":{"schemes":{"list":["a"]}}}]"#,
+                r#"[{"schemes":{"schemes":{"list":["a"]}}}]"#,
+            ),
+            (
+                r#"[{"schemes":["read"]}]"#,
+                r#"[{"schemes":{"schemes":{"list":["read"]}}}]"#,
+            ),
+            // Nested wrapper with an empty scope list.
+            (
+                r#"[{"schemes":{"schemes":{}}}]"#,
+                r#"[{"schemes":{"schemes":{}}}]"#,
+            ),
+            // An empty requirement, both input spellings, written as `{}`.
+            (r#"[{}]"#, r#"[{}]"#),
+            (r#"[{"schemes":{}}]"#, r#"[{}]"#),
+            // Legacy flat input.
+            (
+                r#"[{"bearer":["read"]}]"#,
+                r#"[{"schemes":{"bearer":{"list":["read"]}}}]"#,
+            ),
+            (
+                r#"[{"bearer":["r"],"apiKey":[]}]"#,
+                r#"[{"schemes":{"apiKey":{},"bearer":{"list":["r"]}}}]"#,
+            ),
+            (r#"[{"bearer":[]}]"#, r#"[{"schemes":{"bearer":{}}}]"#),
+        ] {
+            let card = card_with_requirements(shape);
+            let out = serde_json::to_string(&card).unwrap();
+            assert!(
+                out.contains(&format!(r#""securityRequirements":{canonical}"#)),
+                "shape {shape}: {out}"
+            );
+            let back: AgentCard = serde_json::from_str(&out).unwrap();
+            assert_eq!(back, card, "shape {shape}");
+            assert_eq!(serde_json::to_string(&back).unwrap(), out, "shape {shape}");
+        }
+    }
+
+    /// The empty requirement is `{}` on the wire, as ProtoJSON and the JS SDK
+    /// write it, and `{}` and `{"schemes":{}}` are the same requirement.
+    #[test]
+    fn empty_requirement_serializes_as_empty_object() {
+        let mut card = bare_card();
+        card.security_requirements = Some(vec![SecurityRequirement::new()]);
+        let value = serde_json::to_value(&card).unwrap();
+        assert_eq!(value["securityRequirements"], serde_json::json!([{}]));
+        assert_eq!(
+            card_with_requirements("[{}]"),
+            card_with_requirements(r#"[{"schemes":{}}]"#)
+        );
+    }
+
+    /// The card shapes other SDKs emit, recorded from their sources, parse and
+    /// re-serialize to the same JSON.
+    ///
+    /// Python (a2a-python 6ca8593b): the card is served through
+    /// `MessageToDict(card)` (`response_helpers.py:93`), which omits an empty
+    /// repeated field, so an empty `StringList` is `{}` and an empty
+    /// `SecurityRequirement` is `{}`. It reads with `ParseDict`
+    /// (`card_resolver.py:32`), which accepts `{}` and `{"list": []}`.
+    /// JS (a2a-js 9a28d501): `StringList.toJSON` writes `list` only when it is
+    /// non-empty (`protojson.ts:937-942`) and `fromJSON` accepts a missing one
+    /// (`protojson.ts:929-934`).
+    ///
+    /// The Python `a2a` package is not installed on the build host, so this is
+    /// a fixture comparison rather than a run of the SDK parser.
+    #[test]
+    fn other_sdk_emitted_shapes_parse_and_re_serialize_identically() {
+        let emitted = serde_json::json!([
+            {"schemes": {"bearer": {"list": ["read", "write"]}, "apiKey": {}}},
+            {},
+        ]);
+        let card = card_with_requirements(&emitted.to_string());
+        let requirements = card.security_requirements.as_ref().unwrap();
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements[0]["bearer"], ["read", "write"]);
+        assert!(requirements[0]["apiKey"].is_empty());
+        assert!(requirements[1].is_empty());
+
+        let value = serde_json::to_value(&card).unwrap();
+        assert_eq!(value["securityRequirements"], emitted);
+
+        // The ProtoJSON reader form `{"list": []}` reads as the same card.
+        let spelled_out = card_with_requirements(
+            r#"[{"schemes":{"bearer":{"list":["read","write"]},"apiKey":{"list":[]}}},{"schemes":{}}]"#,
+        );
+        assert_eq!(spelled_out, card);
+    }
+
+    fn assert_keys_in_order(json: &str, keys: &[&str]) {
+        let mut at = 0;
+        for key in keys {
+            let found = json[at..]
+                .find(&format!("\"{key}\":"))
+                .unwrap_or_else(|| panic!("{key} missing or out of order in {json}"));
+            at += found + key.len();
+        }
+    }
+
+    const SIX_KEYS: [&str; 6] = ["w", "r", "x", "a", "q", "m"];
+    const SIX_KEYS_SORTED: [&str; 6] = ["a", "m", "q", "r", "w", "x"];
+
+    fn six_scopes() -> HashMap<String, String> {
+        SIX_KEYS
+            .iter()
+            .map(|k| (k.to_string(), format!("{k} access")))
+            .collect()
+    }
+
+    /// Every OAuth flow's `scopes` map serializes sorted, on every run.
+    #[test]
+    fn every_oauth_flow_serializes_scopes_sorted() {
+        fn flows() -> Vec<(&'static str, OAuthFlows)> {
+            vec![
+                (
+                    "authorizationCode",
+                    OAuthFlows::AuthorizationCode(AuthorizationCodeOAuthFlow {
+                        authorization_url: "https://auth.example.com/authorize".to_string(),
+                        token_url: "https://auth.example.com/token".to_string(),
+                        scopes: six_scopes(),
+                        refresh_url: None,
+                        pkce_required: None,
+                    }),
+                ),
+                (
+                    "deviceCode",
+                    OAuthFlows::DeviceCode(DeviceCodeOAuthFlow {
+                        device_authorization_url: "https://auth.example.com/device".to_string(),
+                        token_url: "https://auth.example.com/token".to_string(),
+                        scopes: six_scopes(),
+                        refresh_url: None,
+                    }),
+                ),
+                (
+                    "implicit",
+                    OAuthFlows::Implicit(ImplicitOAuthFlow {
+                        authorization_url: "https://auth.example.com/authorize".to_string(),
+                        scopes: six_scopes(),
+                        refresh_url: None,
+                    }),
+                ),
+                (
+                    "password",
+                    OAuthFlows::Password(PasswordOAuthFlow {
+                        token_url: "https://auth.example.com/token".to_string(),
+                        scopes: six_scopes(),
+                        refresh_url: None,
+                    }),
+                ),
+                (
+                    "clientCredentials",
+                    OAuthFlows::ClientCredentials(ClientCredentialsOAuthFlow {
+                        token_url: "https://auth.example.com/token".to_string(),
+                        scopes: six_scopes(),
+                        refresh_url: None,
+                    }),
+                ),
+            ]
+        }
+
+        for index in 0..5 {
+            let mut distinct = std::collections::HashSet::new();
+            let mut name = "";
+            for _ in 0..40 {
+                let (flow_name, flow) = flows().remove(index);
+                name = flow_name;
+                let mut card = bare_card();
+                card.security_schemes = Some(
+                    [(
+                        "oauth".to_string(),
+                        SecurityScheme::OAuth2(OAuth2SecurityScheme {
+                            flows: flow,
+                            description: None,
+                            oauth2_metadata_url: None,
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                );
+                distinct.insert(serde_json::to_string(&card).unwrap());
+            }
+            assert_eq!(distinct.len(), 1, "flow {name}: {distinct:#?}");
+            let json = distinct.into_iter().next().unwrap();
+            assert!(json.contains(name), "flow {name} missing: {json}");
+            let sorted: Vec<String> = SIX_KEYS_SORTED
+                .iter()
+                .map(|k| format!("{k} access"))
+                .collect();
+            assert_keys_in_order(&json, &SIX_KEYS_SORTED);
+            for text in &sorted {
+                assert!(json.contains(text.as_str()), "{text} missing: {json}");
+            }
+        }
+    }
+
+    fn six_values() -> HashMap<String, Value> {
+        SIX_KEYS
+            .iter()
+            .map(|k| (k.to_string(), serde_json::json!({ "v": k })))
+            .collect()
+    }
+
+    /// `AgentExtension.params` and `AgentCardSignature.header` serialize
+    /// sorted, on every run.
+    #[test]
+    fn extension_params_and_signature_header_serialize_sorted() {
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let mut card = bare_card();
+            card.capabilities.extensions = Some(vec![AgentExtension {
+                uri: "https://example.com/ext".to_string(),
+                description: None,
+                required: None,
+                params: Some(six_values()),
+            }]);
+            card.signatures = Some(vec![AgentCardSignature {
+                protected: "p".to_string(),
+                signature: "s".to_string(),
+                header: Some(six_values()),
+            }]);
+            distinct.insert(serde_json::to_string(&card).unwrap());
+        }
+        assert_eq!(distinct.len(), 1, "{distinct:#?}");
+
+        let json = distinct.into_iter().next().unwrap();
+        let params_at = json.find("\"params\":").expect("params serialized");
+        let header_at = json.find("\"header\":").expect("header serialized");
+        assert_keys_in_order(&json[params_at..], &SIX_KEYS_SORTED);
+        assert_keys_in_order(&json[header_at..], &SIX_KEYS_SORTED);
     }
 }
