@@ -207,7 +207,7 @@ impl JsonRpcTransport {
 ///
 /// SSE line terminators per https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation:
 /// `\n\n`, `\r\r`, and `\r\n\r\n` are all valid event separators.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     find_event_boundary_from(buf, 0)
 }
