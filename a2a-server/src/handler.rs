@@ -7,6 +7,8 @@ use futures::{StreamExt, stream::BoxStream};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 
+use crate::push::dispatcher::{PushDispatcher, PushErrorSink, PushJob};
+
 use crate::middleware::ServiceParams;
 use crate::pagination::resolve_page_size;
 use crate::task_store::apply_history_length;
@@ -28,6 +30,9 @@ struct ActiveExecutionState {
 struct ActiveExecution {
     sender: broadcast::Sender<ExecutionEvent>,
     state: RwLock<ActiveExecutionState>,
+    /// First push delivery error reported by the background dispatcher, kept
+    /// until the execution loop picks it up (see `drive_execution`).
+    push_failure: std::sync::Mutex<Option<A2AError>>,
 }
 
 impl ActiveExecution {
@@ -39,7 +44,24 @@ impl ActiveExecution {
                 sequence: 0,
                 snapshot_task: Some(task),
             }),
+            push_failure: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Remember a push delivery error; only the first one is kept.
+    fn record_push_failure(&self, error: A2AError) {
+        let mut slot = self
+            .push_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.get_or_insert(error);
+    }
+
+    fn take_push_failure(&self) -> Option<A2AError> {
+        self.push_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<ExecutionEvent> {
@@ -138,6 +160,7 @@ struct ExecutionRuntime {
     task_store: Arc<dyn crate::TaskStore>,
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
+    push_dispatcher: Arc<PushDispatcher>,
     execution_manager: Arc<ExecutionManager>,
 }
 
@@ -192,25 +215,33 @@ fn should_interrupt_non_streaming(
     }
 }
 
-async fn send_push_notifications(
+/// Hand `event` to the background push dispatcher.
+///
+/// Never waits for delivery: the event is queued behind the earlier events of
+/// the same task and delivered by that task's worker. Does nothing when push
+/// notifications are not configured. A delivery failure is logged by the
+/// dispatcher and, when `on_error` is given, reported to it.
+fn send_push_notifications(
+    dispatcher: &Arc<PushDispatcher>,
     task_id: &str,
-    push_config_store: Option<&dyn crate::PushConfigStore>,
-    push_sender: Option<&crate::HttpPushSender>,
+    push_config_store: Option<&Arc<dyn crate::PushConfigStore>>,
+    push_sender: Option<&Arc<crate::HttpPushSender>>,
     event: &StreamResponse,
-) -> Result<(), A2AError> {
-    let Some(push_config_store) = push_config_store else {
-        return Ok(());
+    on_error: Option<PushErrorSink>,
+) {
+    let (Some(store), Some(sender)) = (push_config_store, push_sender) else {
+        return;
     };
-    let Some(push_sender) = push_sender else {
-        return Ok(());
-    };
-
-    let configs = push_config_store.list(task_id).await?;
-    for config in configs {
-        push_sender.send_push(&config, event.clone()).await?;
-    }
-
-    Ok(())
+    dispatcher.enqueue(
+        task_id,
+        PushJob {
+            event: event.clone(),
+            terminal: is_terminal_event(event),
+            store: Arc::clone(store),
+            sender: Arc::clone(sender),
+            on_error,
+        },
+    );
 }
 
 async fn save_task(task_store: &dyn crate::TaskStore, mut task: Task) -> Result<Task, A2AError> {
@@ -362,9 +393,21 @@ async fn drive_execution(
         state.snapshot_task.clone()
     };
     let mut stream = runtime.executor.execute(exec_ctx);
+    // Push delivery runs in the background, so a failed delivery (reported
+    // only when the sender is configured with `fail_on_error`) cannot abort
+    // the loop at the event that caused it. It is recorded on the execution
+    // and ends the loop before the next event is applied.
+    let on_push_error: PushErrorSink = {
+        let active = Arc::clone(&active);
+        Arc::new(move |error| active.record_push_failure(error))
+    };
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
+            break;
+        }
+        if let Some(error) = active.take_push_failure() {
+            active.publish(Err(&error), None).await;
             break;
         }
 
@@ -376,17 +419,14 @@ async fn drive_execution(
                 {
                     Ok(updated_task) => {
                         current_task = updated_task.clone();
-                        if let Err(error) = send_push_notifications(
+                        send_push_notifications(
+                            &runtime.push_dispatcher,
                             &task_id,
-                            runtime.push_config_store.as_deref(),
-                            runtime.push_sender.as_deref(),
+                            runtime.push_config_store.as_ref(),
+                            runtime.push_sender.as_ref(),
                             &event,
-                        )
-                        .await
-                        {
-                            active.publish(Err(&error), None).await;
-                            break;
-                        }
+                            Some(Arc::clone(&on_push_error)),
+                        );
                         active.publish(Ok(&event), updated_task).await;
                         if is_terminal_event(&event) {
                             break;
@@ -507,6 +547,7 @@ pub struct DefaultRequestHandler {
     execution_manager: Arc<ExecutionManager>,
     push_config_store: Option<Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<Arc<crate::HttpPushSender>>,
+    push_dispatcher: Arc<PushDispatcher>,
     capabilities: AgentCapabilities,
     default_input_modes: Vec<String>,
     authorizer: Option<Arc<dyn RequestAuthorizer>>,
@@ -542,6 +583,7 @@ impl DefaultRequestHandler {
             execution_manager: Arc::new(ExecutionManager::default()),
             push_config_store: None,
             push_sender: None,
+            push_dispatcher: PushDispatcher::new(),
             capabilities: AgentCapabilities::default(),
             default_input_modes: Vec::new(),
             authorizer: None,
@@ -823,6 +865,7 @@ impl DefaultRequestHandler {
             task_store: Arc::clone(&self.task_store),
             push_config_store: self.push_config_store.clone(),
             push_sender: self.push_sender.clone(),
+            push_dispatcher: Arc::clone(&self.push_dispatcher),
             execution_manager: Arc::clone(&self.execution_manager),
         };
         let active_execution = active.clone();
@@ -1013,13 +1056,16 @@ impl RequestHandler for DefaultRequestHandler {
                             .await?;
                     current_task = updated_task.clone();
 
+                    // Delivery is queued, never awaited: a slow or failing
+                    // webhook can neither delay nor fail the cancellation.
                     send_push_notifications(
+                        &self.push_dispatcher,
                         &req.id,
-                        self.push_config_store.as_deref(),
-                        self.push_sender.as_deref(),
+                        self.push_config_store.as_ref(),
+                        self.push_sender.as_ref(),
                         &event,
-                    )
-                    .await?;
+                        None,
+                    );
 
                     if let Some(active) = &active_execution {
                         active.publish(Ok(&event), updated_task).await;
@@ -1669,6 +1715,289 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// Emits `count` working updates, each tagged with its index in the event
+    /// metadata, and then completes the task.
+    struct IndexedEventsExecutor {
+        count: u64,
+        /// Pause before each event, to let background work run in between.
+        gap: Duration,
+    }
+
+    impl crate::AgentExecutor for IndexedEventsExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let mut events = Vec::new();
+            for index in 0..self.count {
+                events.push(Ok(StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                    task_id: ctx.task_id.clone(),
+                    context_id: ctx.context_id.clone(),
+                    status: TaskStatus {
+                        state: TaskState::Working,
+                        message: None,
+                        timestamp: None,
+                    },
+                    metadata: Some(HashMap::from([("i".to_owned(), serde_json::json!(index))])),
+                })));
+            }
+            events.push(Ok(StreamResponse::Task(Task {
+                id: ctx.task_id.clone(),
+                context_id: ctx.context_id.clone(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })));
+            let gap = self.gap;
+            Box::pin(stream::iter(events).then(move |event| async move {
+                tokio::time::sleep(gap).await;
+                event
+            }))
+        }
+
+        fn cancel(
+            &self,
+            _ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(stream::empty())
+        }
+    }
+
+    /// Webhook that answers only after `delay`.
+    async fn slow_push(State(delay): State<Duration>) -> StatusCode {
+        tokio::time::sleep(delay).await;
+        StatusCode::ACCEPTED
+    }
+
+    /// Webhook that records the index of every event it receives. Events with
+    /// an even index are answered slowly and odd ones at once, so a sender
+    /// that delivered concurrently would reorder them.
+    async fn indexed_push(
+        State(sender): State<mpsc::UnboundedSender<u64>>,
+        body: Bytes,
+    ) -> StatusCode {
+        let event: StreamResponse = serde_json::from_slice(&body).unwrap();
+        let index = match event {
+            StreamResponse::StatusUpdate(update) => update
+                .metadata
+                .and_then(|metadata| metadata.get("i").and_then(serde_json::Value::as_u64))
+                .unwrap(),
+            _ => u64::MAX,
+        };
+        if index % 2 == 0 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        sender.send(index).unwrap();
+        StatusCode::ACCEPTED
+    }
+
+    async fn serve(app: Router) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}/"), shutdown_tx, server)
+    }
+
+    fn local_push_handler(executor: impl crate::AgentExecutor) -> DefaultRequestHandler {
+        // URL validation is off because the test webhook is on 127.0.0.1.
+        DefaultRequestHandler::new(executor, InMemoryTaskStore::new()).with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                validate_urls: false,
+                ..Default::default()
+            })),
+        )
+    }
+
+    fn streaming_request(task_id: &str) -> SendMessageRequest {
+        let mut message = make_message();
+        message.task_id = Some(task_id.into());
+        message.context_id = Some(format!("ctx-{task_id}"));
+        SendMessageRequest {
+            message,
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_webhook_does_not_block_streaming() {
+        install_crypto_provider();
+        let app = Router::new()
+            .route("/", post(slow_push))
+            .with_state(Duration::from_secs(2));
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = local_push_handler(IndexedEventsExecutor {
+            count: 3,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-slow", "ctx-t-slow").await;
+        let mut config = push_config("t-slow");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let mut events = handler
+            .send_streaming_message(&params, streaming_request("t-slow"))
+            .await
+            .unwrap();
+        let mut received = 0;
+        while let Some(event) = events.next().await {
+            event.unwrap();
+            received += 1;
+        }
+        let elapsed = started.elapsed();
+
+        // Four events, each pushed to a webhook that takes 2s: the stream
+        // must finish long before even the first push has completed.
+        assert_eq!(received, 4);
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "streaming was delayed by the webhook: {elapsed:?}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_delivery_order_is_preserved_per_task() {
+        install_crypto_provider();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/", post(indexed_push))
+            .with_state(sender);
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = local_push_handler(IndexedEventsExecutor {
+            count: 12,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-order", "ctx-t-order").await;
+        let mut config = push_config("t-order");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let mut events = handler
+            .send_streaming_message(&params, streaming_request("t-order"))
+            .await
+            .unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+
+        let mut seen = Vec::new();
+        while seen.len() < 13 {
+            let index = timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            seen.push(index);
+        }
+        let mut expected: Vec<u64> = (0..12).collect();
+        expected.push(u64::MAX);
+        assert_eq!(seen, expected);
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_push_with_fail_on_error_ends_the_execution() {
+        install_crypto_provider();
+        async fn reject() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let (url, shutdown_tx, server) = serve(Router::new().route("/", post(reject))).await;
+        let handler = DefaultRequestHandler::new(
+            IndexedEventsExecutor {
+                count: 6,
+                gap: Duration::from_millis(100),
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                validate_urls: false,
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-fail", "ctx-t-fail").await;
+        let mut config = push_config("t-fail");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-fail"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        // The failure is not lost: the stream ends with an error, before the
+        // task could complete.
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(events.len() < 7, "execution kept running: {events:?}");
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_does_not_wait_for_a_slow_webhook() {
+        install_crypto_provider();
+        let app = Router::new()
+            .route("/", post(slow_push))
+            .with_state(Duration::from_secs(2));
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = local_push_handler(PushEventExecutor);
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cancel", "ctx-t-cancel").await;
+        let mut config = push_config("t-cancel");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let task = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cancel".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "cancel waited for the webhook: {:?}",
+            started.elapsed()
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

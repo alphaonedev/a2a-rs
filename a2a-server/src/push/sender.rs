@@ -20,7 +20,14 @@ pub struct HttpPushSender {
 pub struct HttpPushSenderConfig {
     /// HTTP request timeout (default: 30s).
     pub timeout: Duration,
-    /// If true, push sending errors abort execution.
+    /// If true, push sending errors are returned from
+    /// [`HttpPushSender::send_push`] instead of only being logged.
+    ///
+    /// [`DefaultRequestHandler`](crate::DefaultRequestHandler) delivers
+    /// pushes on a background queue, so an error cannot fail the event that
+    /// caused it. It is logged, recorded on the task's execution, and ends the
+    /// execution with an error to its subscribers before the next event is
+    /// applied. It never fails `cancel_task`.
     pub fail_on_error: bool,
     /// If true (default), guard push URLs against SSRF. A string pre-check
     /// (scheme must be http/https; host must not be a loopback, private,
