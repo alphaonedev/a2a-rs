@@ -59,7 +59,7 @@ impl RestTransport {
     /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
     /// On a streaming (SSE) call the same bound caps one event: an event larger
     /// than it ends the stream with an error naming the limit (the buffer holds
-    /// at most the cap plus one transport chunk).
+    /// at most the cap plus three bytes of a partial boundary plus one transport chunk).
     /// An error response whose body is over the cap, or cannot be read, still
     /// reports its HTTP status, with an empty body.
     #[must_use]

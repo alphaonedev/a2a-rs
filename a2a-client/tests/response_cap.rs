@@ -519,9 +519,13 @@ fn default_cap_is_ten_mib() {
 }
 
 /// A body that disagrees with its `Content-Length` is never counted against
-/// the cap: the HTTP layer enforces the declared framing, so a longer body is
-/// cut at the declared length and a shorter one fails to read. Either way the
-/// client errors out without crossing the cap and without reading the excess.
+/// the cap: the HTTP layer enforces the declared framing. A longer body is cut
+/// at the declared length and only that prefix is parsed (the excess is never
+/// read; a valid declared prefix is a successful response, see
+/// `longer_body_with_a_valid_declared_prefix_is_read_up_to_the_declared_length`).
+/// A shorter body is a read error once the peer closes, or at the read timeout
+/// if one is set (`with_read_timeout`; none is set by default, so a peer that
+/// holds the connection open stalls the call: the cap bounds memory, not time).
 #[tokio::test]
 async fn body_that_disagrees_with_its_content_length_is_not_counted_against_the_cap() {
     // Understated: declares 64 bytes, then sends 64 KiB (far over the cap).
@@ -541,4 +545,31 @@ async fn body_that_disagrees_with_its_content_length_is_not_counted_against_the_
         .expect_err("a body shorter than its declared length fails to read");
     let text = err.to_string();
     assert!(!text.contains("exceeds"), "{text}");
+}
+
+/// A body longer than its `Content-Length` is read up to the declared length
+/// and no further: when that prefix is itself a valid response the call
+/// succeeds, on both bindings, and the excess (far over the cap) is never
+/// read or counted.
+#[tokio::test]
+async fn longer_body_with_a_valid_declared_prefix_is_read_up_to_the_declared_length() {
+    let excess = vec![b' '; SMALL_CAP * 64];
+
+    let mut body = JSONRPC_TASK.as_bytes().to_vec();
+    body.extend_from_slice(&excess);
+    let endpoint = serve_truncated("200 OK", JSONRPC_TASK.len(), body).await;
+    let task = jsonrpc(endpoint)
+        .get_task(&ServiceParams::new(), &get_task_request())
+        .await
+        .expect("the declared prefix is a complete response");
+    assert_eq!(task.id, "t1");
+
+    let mut body = REST_TASK.as_bytes().to_vec();
+    body.extend_from_slice(&excess);
+    let base = serve_truncated("200 OK", REST_TASK.len(), body).await;
+    let task = rest(base)
+        .get_task(&ServiceParams::new(), &get_task_request())
+        .await
+        .expect("the declared prefix is a complete response");
+    assert_eq!(task.id, "t1");
 }

@@ -61,7 +61,7 @@ impl JsonRpcTransport {
     /// memory. Defaults to [`DEFAULT_MAX_RESPONSE_BODY_BYTES`](crate::DEFAULT_MAX_RESPONSE_BODY_BYTES).
     /// On a streaming (SSE) call the same bound caps one event: an event larger
     /// than it ends the stream with an error naming the limit (the buffer holds
-    /// at most the cap plus one transport chunk).
+    /// at most the cap plus three bytes of a partial boundary plus one transport chunk).
     #[must_use]
     pub fn with_max_response_bytes(mut self, max_bytes: usize) -> Self {
         self.max_response_bytes = max_bytes;
@@ -221,6 +221,7 @@ pub(crate) fn find_event_boundary(buf: &[u8]) -> Option<(usize, usize)> {
 /// than O(buffer).
 pub(crate) fn find_event_boundary_from(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     for i in from..buf.len().saturating_sub(1) {
+        sse_work::note(1);
         if buf[i] == b'\n' && buf[i + 1] == b'\n' {
             return Some((i, i + 2));
         }
@@ -237,6 +238,32 @@ pub(crate) fn find_event_boundary_from(buf: &[u8], from: usize) -> Option<(usize
 /// How far before the end of an already-scanned buffer a resumed boundary
 /// scan starts: the longest boundary (`\r\n\r\n`) minus one byte.
 const BOUNDARY_OVERLAP: usize = 3;
+
+/// Test-only count of the buffer bytes the SSE parser examines or moves, so a
+/// test can bound the work deterministically instead of timing it.
+#[cfg(test)]
+mod sse_work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static WORK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note(bytes: usize) {
+        WORK.with(|w| w.set(w.get().saturating_add(bytes)));
+    }
+
+    pub(super) fn take() -> usize {
+        WORK.with(|w| w.replace(0))
+    }
+}
+
+/// No-op outside tests.
+#[cfg(not(test))]
+mod sse_work {
+    #[inline(always)]
+    pub(super) fn note(_bytes: usize) {}
+}
 
 /// The error for a streamed event larger than the configured cap.
 fn sse_event_too_large(max_event_bytes: usize) -> A2AError {
@@ -315,7 +342,8 @@ pub(crate) fn parse_stream_tail(
 /// An event is refused once its buffered bytes exceed `max_event_bytes`: an
 /// event that is larger, complete or not, ends the stream with an error naming
 /// the limit, so a peer that never sends an event boundary cannot grow client
-/// memory. The buffer holds at most the cap plus one transport chunk. The
+/// memory. The buffer holds at most the cap plus three bytes of a partial boundary
+/// plus one transport chunk. The
 /// boundary scan resumes where the last one stopped and events are sliced out
 /// of the buffer in place (the consumed prefix is dropped once per chunk), so
 /// the total cost is linear in the bytes received.
@@ -402,6 +430,7 @@ where
                         if st.finished {
                             st.buf = Vec::new();
                         } else {
+                            sse_work::note(st.buf.len().saturating_sub(consumed));
                             st.buf.drain(..consumed);
                             // A boundary is at most four bytes and may
                             // straddle two chunks, so a pending partial one
@@ -427,6 +456,17 @@ where
                         // rather than dropping it (#197).
                         let tail = std::mem::take(&mut st.buf);
                         st.finished = true;
+                        // The cap applies to an unterminated final event too:
+                        // up to a partial boundary may trail it.
+                        let trailing = tail
+                            .iter()
+                            .rev()
+                            .take(BOUNDARY_OVERLAP)
+                            .take_while(|b| matches!(**b, b'\r' | b'\n'))
+                            .count();
+                        if tail.len() - trailing > max_event_bytes {
+                            return Some((Err(sse_event_too_large(max_event_bytes)), st));
+                        }
                         return parse_stream_tail(&tail, &st.parse_event).map(|item| (item, st));
                     }
                 }
@@ -439,7 +479,7 @@ where
 
 /// Parse an SSE byte stream into StreamResponse events (JSON-RPC envelope),
 /// refusing an event once its buffered bytes exceed `max_event_bytes` (the
-/// buffer holds at most the cap plus one transport chunk).
+/// buffer holds at most the cap plus three bytes of a partial boundary plus one transport chunk).
 fn parse_sse_stream_capped(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     max_event_bytes: usize,
@@ -500,7 +540,7 @@ fn parse_sse_stream_capped(
 /// Unlike the JSON-RPC variant, this expects data lines to contain
 /// raw StreamResponse JSON (not wrapped in a JSON-RPC envelope).
 /// An event is refused once its buffered bytes exceed `max_event_bytes` (the
-/// buffer holds at most the cap plus one transport chunk).
+/// buffer holds at most the cap plus three bytes of a partial boundary plus one transport chunk).
 pub(crate) fn parse_sse_stream_rest_capped(
     stream: impl futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     max_event_bytes: usize,
@@ -2269,16 +2309,22 @@ mod tests {
         }
     }
 
+    /// Most buffer bytes (examined by the boundary scan or moved by a drain)
+    /// the parser may touch per input byte. The linear parser scans each byte
+    /// once, re-scans at most `BOUNDARY_OVERLAP` bytes per read and moves only
+    /// the unconsumed tail per read, so it stays near 1x; the old per-event
+    /// drain moved the whole remaining buffer once per event.
+    const MAX_WORK_PER_INPUT_BYTE: usize = 2;
+
     /// A 1 MiB stream of minimal events, delivered as large reads the way a
-    /// fast peer does, is parsed in time linear in its size: the event count
-    /// is exact and the wall clock stays under a bound that is generous for
-    /// linear work (a few ms in release) but not for the old per-event
-    /// buffer shift (quadratic within a read).
+    /// fast peer does: the event count is exact and the parser touches at
+    /// most `MAX_WORK_PER_INPUT_BYTE` times the input length. The counter is
+    /// deterministic, so this fails on the old per-event buffer shift on any
+    /// host. The wall clock is printed only.
     #[tokio::test]
-    async fn test_sse_one_mib_of_tiny_events_parses_in_linear_time() {
+    async fn test_sse_one_mib_of_tiny_events_work_is_linear() {
         const TOTAL: usize = 1024 * 1024;
         const READ: usize = 256 * 1024;
-        const WALL_CLOCK_BOUND_SECS: u64 = 3;
         let event = format!(
             "data: {}\n\n",
             r#"{"statusUpdate":{"taskId":"t","contextId":"c","status":{"state":"TASK_STATE_WORKING"}}}"#
@@ -2291,33 +2337,41 @@ mod tests {
             .map(|c| String::from_utf8(c.to_vec()).unwrap())
             .collect();
 
+        sse_work::take();
         let started = std::time::Instant::now();
         let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(chunks), 64 * 1024)
             .collect()
             .await;
         let elapsed = started.elapsed();
-        eprintln!("tiny-events: {count} events, {elapsed:?}");
+        let work = sse_work::take();
+        eprintln!(
+            "tiny-events: {count} events, input {} bytes, work {work}, {elapsed:?}",
+            all.len()
+        );
 
         assert_eq!(items.len(), count);
         assert!(items.iter().all(Result::is_ok));
         assert!(
-            elapsed < std::time::Duration::from_secs(WALL_CLOCK_BOUND_SECS),
-            "parsing {count} events took {elapsed:?}"
+            work <= MAX_WORK_PER_INPUT_BYTE * all.len(),
+            "parser touched {work} bytes for {} input bytes",
+            all.len()
         );
     }
 
     /// Hostile variant: 1 MiB of minimal (empty) events in one read. Every
     /// event reaches the parse callback exactly once, nothing is delivered,
-    /// and the wall clock stays under a bound that is generous for linear
-    /// work (milliseconds in release) but far below the quadratic cost of
-    /// the old per-event buffer shift (tens of seconds in a debug build).
+    /// and the parser touches at most `MAX_WORK_PER_INPUT_BYTE` times the
+    /// input length (deterministic: the old parser moved about 2.6e11 bytes
+    /// here). A secondary wall-clock bound of 1 s guards the same stream.
     #[tokio::test]
-    async fn test_sse_one_mib_of_minimal_events_is_counted_in_linear_time() {
-        const WALL_CLOCK_BOUND_SECS: u64 = 5;
+    async fn test_sse_one_mib_of_minimal_events_work_is_linear() {
+        const WALL_CLOCK_BOUND_SECS: u64 = 1;
         const EVENTS: usize = 512 * 1024;
         let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&seen);
         let body = "\n\n".repeat(EVENTS);
+        let input_len = body.len();
+        sse_work::take();
         let started = std::time::Instant::now();
         let items: Vec<_> = parse_sse_bytes(
             byte_stream(vec![body]),
@@ -2330,13 +2384,55 @@ mod tests {
         .collect()
         .await;
         let elapsed = started.elapsed();
-        eprintln!("empty-events: {elapsed:?}");
+        let work = sse_work::take();
+        eprintln!("empty-events: input {input_len} bytes, work {work}, {elapsed:?}");
         assert!(items.is_empty(), "{} items", items.len());
         assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), EVENTS);
+        assert!(
+            work <= MAX_WORK_PER_INPUT_BYTE * input_len,
+            "parser touched {work} bytes for {input_len} input bytes"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(WALL_CLOCK_BOUND_SECS),
             "parsing {EVENTS} events took {elapsed:?}"
         );
+    }
+
+    /// The cap also bounds an unterminated final event at the end of the
+    /// stream: one byte over is refused, exactly the cap followed by any
+    /// partial terminator (up to three bytes) is accepted.
+    #[tokio::test]
+    async fn test_sse_unterminated_final_event_respects_the_cap() {
+        let body = format!("data: {}", status_event_data());
+        let cap = body.len();
+
+        let over = format!("{body} ");
+        let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(vec![over]), cap)
+            .collect()
+            .await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].as_ref().unwrap_err().message.contains("exceeds"));
+
+        for over_by in 1..=3 {
+            let tail = format!("{body}{}", "x".repeat(over_by));
+            let items: Vec<_> = parse_sse_stream_rest_capped(byte_stream(vec![tail]), cap)
+                .collect()
+                .await;
+            assert_eq!(items.len(), 1, "over by {over_by}: {items:?}");
+            assert!(
+                items[0].as_ref().unwrap_err().message.contains("exceeds"),
+                "over by {over_by}: {items:?}"
+            );
+        }
+
+        for partial in ["\n", "\r", "\r\n", "\r\n\r", "\n\n"] {
+            let items: Vec<_> =
+                parse_sse_stream_rest_capped(byte_stream(vec![format!("{body}{partial}")]), cap)
+                    .collect()
+                    .await;
+            assert_eq!(items.len(), 1, "partial {partial:?}: {items:?}");
+            assert!(items[0].is_ok(), "partial {partial:?}: {items:?}");
+        }
     }
 
     /// Resuming the scan `BOUNDARY_OVERLAP` bytes before the end of a prefix
