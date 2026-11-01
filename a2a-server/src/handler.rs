@@ -2913,7 +2913,9 @@ mod tests {
     /// case: its request starts only when a slot frees up after
     /// floor(40 / 4) = 10 request times, it fails at once, and nothing is
     /// awaited after it, so the run ends within 11 request times (11 x
-    /// 300 ms) plus 1500 ms of slack for a loaded host.
+    /// 300 ms) plus 1500 ms of slack for a loaded host. The test also asserts
+    /// the lower bound, 10 request times, so a store that loses the order
+    /// fails it.
     #[tokio::test]
     async fn a_failure_behind_slow_successful_configs_is_known_within_the_documented_bound() {
         install_crypto_provider();
@@ -2969,6 +2971,10 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(11 * 300 + 1500),
             "the failure was not known within the documented bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(10 * 300),
+            "the failing config was not listed last, the worst case was lost: {elapsed:?}"
         );
 
         shutdown_tx.send(()).unwrap();

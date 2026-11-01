@@ -158,8 +158,8 @@ impl HttpPushSender {
     /// [`Self::send_push`] with an optional limiter on requests in flight.
     ///
     /// A permit of `gate` is held only while the HTTP request is in flight,
-    /// never while validation runs, so a limiter
-    /// shared by many deliveries bounds requests, not deliveries.
+    /// never while validation runs, so a limiter shared by many deliveries
+    /// bounds requests, not deliveries.
     pub(crate) async fn send_push_gated(
         &self,
         config: &TaskPushNotificationConfig,
