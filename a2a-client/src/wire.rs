@@ -141,9 +141,12 @@ const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 /// the cap. A body that disagrees with its declared length cannot pass the cap
 /// either: the HTTP layer enforces the framing, so a longer body is cut to the
 /// declared length and only that prefix is parsed; a shorter one is a read
-/// error once the peer closes, or at the read timeout if one is set (none by
-/// default, so a peer that holds the connection open stalls the call), and
-/// neither is counted against the cap. The buffer is sized from
+/// error once the peer closes, or at the read timeout if one is set, and
+/// neither is counted against the cap. Every read waits on the peer: with no
+/// read timeout (the default) a peer that holds the connection open before
+/// the body ends, whether short of its `Content-Length`, without its last
+/// chunk or never closing a close-delimited body, stalls the call until it
+/// closes the connection; the cap bounds memory, not time. The buffer is sized from
 /// the declared length (bounded by the cap) and grows by doubling but never
 /// past the cap, so the transient peak stays at the cap plus allocator
 /// rounding. One leading UTF-8 byte order mark is removed. `context` prefixes
