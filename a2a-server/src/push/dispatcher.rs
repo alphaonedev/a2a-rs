@@ -33,12 +33,14 @@
 //! * A caller that waits for a task's pushes (a strict sender, see
 //!   [`HttpPushSender`]'s `fail_on_error`) waits behind everything already
 //!   queued for the task: up to [`PUSH_QUEUE_CAPACITY_PER_TASK`] events x
-//!   `ceil(configs / 4)` x the time of one request, unless a failure is
+//!   `ceil(configs / 4)` x the time of one request (with retries: the
+//!   request timeout x the attempts plus the backoff), unless a failure is
 //!   recorded first. A strict job reports its first failed request at once:
 //!   the other requests of the event are cancelled or never started, the
 //!   caller's error sink abandons the jobs queued behind it, and nothing is
 //!   awaited after that first error, so the failure is known about one
-//!   request time after the first request of the failing event was sent.
+//!   request time (with retries, one request's attempts and backoff) after
+//!   the first request of the failing event was sent.
 //! * The worker for a task is removed in the same critical section that finds
 //!   its queue empty, so a later event for the task starts a new worker and
 //!   two workers for one task never overlap. A panic inside a delivery is

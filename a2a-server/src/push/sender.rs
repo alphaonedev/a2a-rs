@@ -192,7 +192,8 @@ pub struct HttpPushSenderConfig {
     ///     (a failure recorded by a concurrent execution does not shorten
     ///     the cancellation's wait). That is a latency cost strict mode opts
     ///     into. With no failure the wait can reach the queue depth (64) x
-    ///     ceil(configs / 4) x the time of one request;
+    ///     ceil(configs / 4) x the time of one request (with retries: the
+    ///     request timeout x the attempts, plus the backoff between them);
     ///   * an event dropped because the task's queue was full is reported as
     ///     an error naming the full queue.
     pub fail_on_error: bool,
@@ -1372,6 +1373,10 @@ mod tests {
     /// before the 30 s request timeout; the policy retries each of them. Three
     /// attempts therefore take at least 3 x 200 ms and, with backoff of at
     /// most 20 ms between them, well under the sum of the bounds plus slack.
+    ///
+    /// Linux only: a full accept queue drops the connection attempt there,
+    /// while macOS refuses it at once, which is a different (instant) error.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn connect_timeout_ends_each_attempt_and_is_retried() {
         install_crypto_provider();
