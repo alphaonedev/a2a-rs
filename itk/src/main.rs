@@ -664,12 +664,11 @@ impl ItkHandler {
             // 127.0.0.1, which HttpPushSender's default SSRF guard blocks --
             // appropriate for a real deployment, not for this reference
             // agent talking to a test harness on loopback.
+            let mut push_config = HttpPushSenderConfig::default();
+            push_config.validate_urls = false;
             inner = inner.with_push_notifications(
                 InMemoryPushConfigStore::new(),
-                HttpPushSender::new(Some(HttpPushSenderConfig {
-                    validate_urls: false,
-                    ..Default::default()
-                })),
+                HttpPushSender::new(Some(push_config)),
             );
         }
 

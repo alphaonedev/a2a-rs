@@ -37,7 +37,10 @@ pub use handler::{
     DefaultRequestHandler, ExtendedAgentCardResolver, RequestAuthorizer, RequestHandler,
 };
 pub use middleware::{CallContext, CallInterceptor, InterceptedHandler, ServiceParams, User};
-pub use push::{HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore, PushConfigStore};
+pub use push::{
+    Backoff, HttpPushSender, HttpPushSenderConfig, InMemoryPushConfigStore, PushConfigStore,
+    RetryPolicy,
+};
 pub use task_store::{InMemoryTaskStore, TaskStore};
 
 /// Build an `INTERNAL_ERROR` whose client-visible message is generic, while

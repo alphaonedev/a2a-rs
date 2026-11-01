@@ -14,12 +14,153 @@ pub struct HttpPushSender {
     client: reqwest::Client,
     fail_on_error: bool,
     validate_urls: bool,
+    retry: RetryPolicy,
+}
+
+/// Capped exponential backoff with jitter, used between push delivery
+/// attempts.
+///
+/// The wait before retry number `n` (counting from 1) is drawn uniformly from
+/// the upper half of `min(initial * 2^(n - 1), max)`, so retries of many
+/// deliveries that failed together do not all hit the webhook at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Backoff {
+    /// Upper bound of the wait before the first retry.
+    pub initial: Duration,
+    /// Upper bound of the wait before any retry.
+    pub max: Duration,
+}
+
+impl Backoff {
+    /// Backoff growing from `initial` and never exceeding `max`.
+    pub const fn new(initial: Duration, max: Duration) -> Self {
+        Backoff { initial, max }
+    }
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff::new(Duration::from_millis(200), Duration::from_secs(5))
+    }
+}
+
+/// How [`HttpPushSender`] retries a delivery that failed for a transient
+/// reason.
+///
+/// Only connect errors, `429 Too Many Requests` and `5xx` responses are
+/// retried; any other response (including every other `4xx`) and any other
+/// transport error, such as a timeout after the request was sent, is final.
+/// A `Retry-After` header given in seconds lengthens the wait, but never
+/// beyond [`Backoff::max`]: a response asking for a longer pause is treated as
+/// final and is not retried. A `Retry-After` given as an HTTP date is ignored
+/// and the backoff alone applies.
+///
+/// Retries sleep inside [`HttpPushSender::send_push`], so a caller that awaits
+/// it waits for them. [`DefaultRequestHandler`](crate::DefaultRequestHandler)
+/// delivers on a background queue (since the push dispatcher), so there the
+/// waiting does not delay the task; a custom caller of `send_push` must not
+/// await it on a latency-sensitive path. A request-limiter permit is never held
+/// during the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RetryPolicy {
+    /// Total number of attempts, the first included. `0` and `1` both mean
+    /// no retry.
+    pub max_attempts: u32,
+    /// Wait between attempts.
+    pub backoff: Backoff,
+}
+
+impl RetryPolicy {
+    /// A policy making up to `max_attempts` attempts with `backoff` between
+    /// them.
+    pub const fn new(max_attempts: u32, backoff: Backoff) -> Self {
+        RetryPolicy {
+            max_attempts,
+            backoff,
+        }
+    }
+
+    /// A policy that never retries.
+    pub const fn none() -> Self {
+        RetryPolicy::new(1, Backoff::new(Duration::ZERO, Duration::ZERO))
+    }
+
+    /// The number of attempts that will be made: [`Self::max_attempts`], at
+    /// least 1.
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts.max(1)
+    }
+
+    /// The wait before retry number `retry` (1 for the first retry).
+    pub fn delay_before_retry(&self, retry: u32) -> Duration {
+        let doublings = retry.saturating_sub(1).min(31);
+        let ceiling = self
+            .backoff
+            .initial
+            .saturating_mul(1u32 << doublings)
+            .min(self.backoff.max);
+        let floor = ceiling / 2;
+        floor + (ceiling - floor).mul_f64(random_unit())
+    }
+}
+
+impl Default for RetryPolicy {
+    /// Three attempts with [`Backoff::default`].
+    fn default() -> Self {
+        RetryPolicy::new(3, Backoff::default())
+    }
+}
+
+/// A uniformly distributed value in `[0, 1)` that does not need a
+/// cryptographic source: it only spreads retries apart.
+fn random_unit() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let bits = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// The `Retry-After` header when it is a whole number of seconds.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Configuration for [`HttpPushSender`].
+///
+/// The struct is `#[non_exhaustive]` so that new settings are not breaking
+/// changes. Outside this crate build it from [`Default`] and assign the fields
+/// to change; a struct expression, even with `..Default::default()`, is not
+/// allowed there:
+///
+/// ```
+/// use a2a_server::HttpPushSenderConfig;
+///
+/// let mut config = HttpPushSenderConfig::default();
+/// config.validate_urls = false;
+/// ```
+#[non_exhaustive]
 pub struct HttpPushSenderConfig {
     /// HTTP request timeout (default: 30s).
     pub timeout: Duration,
+    /// Timeout for establishing the connection of one attempt (default: 10s).
+    /// A connect timeout counts as a connect error and is retried according to
+    /// [`Self::retry`]; [`Self::timeout`] still bounds the whole request.
+    pub connect_timeout: Duration,
     /// If true, push sending errors are returned from
     /// [`HttpPushSender::send_push`] instead of only being logged.
     ///
@@ -53,14 +194,19 @@ pub struct HttpPushSenderConfig {
     /// pushing to local webhooks in trusted test environments; that turns off
     /// the whole guard.
     pub validate_urls: bool,
+    /// Retry of transient delivery failures (default: [`RetryPolicy::default`]).
+    /// Use [`RetryPolicy::none`] to try each delivery once.
+    pub retry: RetryPolicy,
 }
 
 impl Default for HttpPushSenderConfig {
     fn default() -> Self {
         HttpPushSenderConfig {
             timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
             fail_on_error: false,
             validate_urls: true,
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -82,7 +228,9 @@ impl HttpPushSender {
         //     itself, leaving only the proxy address screened.
         // When validation is off (the single documented opt-out for local test
         // webhooks), keep reqwest's defaults so loopback targets still work.
-        let mut builder = reqwest::Client::builder().timeout(config.timeout);
+        let mut builder = reqwest::Client::builder()
+            .timeout(config.timeout)
+            .connect_timeout(config.connect_timeout);
         if config.validate_urls {
             builder = builder
                 .dns_resolver(Arc::new(SsrfGuardedResolver))
@@ -94,6 +242,7 @@ impl HttpPushSender {
             client,
             fail_on_error: config.fail_on_error,
             validate_urls: config.validate_urls,
+            retry: config.retry,
         }
     }
 
@@ -174,20 +323,65 @@ impl HttpPushSender {
             }
         }
 
-        // The semaphore is never closed, so `acquire` cannot fail.
-        let _permit = match gate {
-            Some(gate) => gate.acquire().await.ok(),
-            None => None,
+        let request = match request.build() {
+            Ok(request) => request,
+            Err(e) => return self.handle_error(format!("failed to build push request: {e}")),
         };
-        match request.send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    return self
-                        .handle_error(format!("push endpoint returned status: {}", resp.status()));
+
+        let max_attempts = self.retry.max_attempts();
+        let mut attempt = 1;
+        loop {
+            let Some(this_attempt) = request.try_clone() else {
+                return self.handle_error("push request body cannot be replayed".to_string());
+            };
+            // The permit is held for this one request only: never across
+            // the retry sleep below. The semaphore is never closed, so
+            // `acquire` cannot fail.
+            let outcome = {
+                let _permit = match gate {
+                    Some(gate) => gate.acquire().await.ok(),
+                    None => None,
+                };
+                self.client.execute(this_attempt).await
+            };
+            let (message, retry_after) = match outcome {
+                Ok(resp) if resp.status().is_success() => return Ok(()),
+                Ok(resp) => {
+                    let message = format!("push endpoint returned status: {}", resp.status());
+                    if !is_retryable_status(resp.status()) {
+                        return self.handle_error(message);
+                    }
+                    let retry_after = retry_after(&resp);
+                    // A server that asks for a longer pause than the cap is
+                    // not retried: waiting for it would hold this delivery
+                    // (and the task's queue) past the configured bound.
+                    if retry_after.is_some_and(|wait| wait > self.retry.backoff.max) {
+                        return self.handle_error(format!(
+                            "{message}; Retry-After exceeds the {:?} retry cap",
+                            self.retry.backoff.max
+                        ));
+                    }
+                    (message, retry_after)
                 }
-                Ok(())
+                Err(e) => {
+                    let message = format!("failed to send push notification: {e}");
+                    if !e.is_connect() {
+                        return self.handle_error(message);
+                    }
+                    (message, None)
+                }
+            };
+            if attempt >= max_attempts {
+                return self.handle_error(message);
             }
-            Err(e) => self.handle_error(format!("failed to send push notification: {e}")),
+
+            let delay = self
+                .retry
+                .delay_before_retry(attempt)
+                .max(retry_after.unwrap_or_default());
+            tracing::warn!(attempt, max_attempts, ?delay, "{message}; retrying");
+            tokio::time::sleep(delay).await;
+            attempt += 1;
         }
     }
 
@@ -379,6 +573,8 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(30));
         assert!(!config.fail_on_error);
         assert!(config.validate_urls);
+        assert_eq!(config.retry, RetryPolicy::default());
+        assert_eq!(config.retry.max_attempts(), 3);
     }
 
     #[test]
@@ -396,6 +592,8 @@ mod tests {
             timeout: Duration::from_secs(10),
             fail_on_error: true,
             validate_urls: false,
+            retry: RetryPolicy::none(),
+            ..Default::default()
         };
         let sender = HttpPushSender::new(Some(config));
         assert!(sender.fail_on_error);
@@ -409,6 +607,8 @@ mod tests {
             timeout: Duration::from_secs(5),
             fail_on_error: true,
             validate_urls: true,
+            retry: RetryPolicy::none(),
+            ..Default::default()
         }));
         let result = sender.handle_error("test error".to_string());
         assert!(result.is_err());
@@ -477,6 +677,8 @@ mod tests {
             timeout: std::time::Duration::from_millis(100),
             fail_on_error: true,
             validate_urls: false,
+            retry: RetryPolicy::none(),
+            ..Default::default()
         }));
         let config = sample_config("http://127.0.0.1:1/callback");
         let result = sender.send_push(&config, sample_status_update()).await;
@@ -891,5 +1093,263 @@ mod tests {
             .await
             .expect_err("a loopback self-redirect must be refused, not followed");
         assert!(err.is_redirect(), "expected a redirect-policy error: {err}");
+    }
+
+    /// Webhook that answers `status` for its first `fail_first` requests and
+    /// 202 afterwards. Returns its URL and a request counter.
+    async fn flaky_webhook(
+        status: u16,
+        fail_first: usize,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    let seen = counter.fetch_add(1, Ordering::SeqCst);
+                    if seen < fail_first {
+                        axum::http::StatusCode::from_u16(status).unwrap()
+                    } else {
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), hits)
+    }
+
+    fn retrying_sender(max_attempts: u32) -> HttpPushSender {
+        HttpPushSender::new(Some(HttpPushSenderConfig {
+            fail_on_error: true,
+            validate_urls: false,
+            retry: RetryPolicy::new(
+                max_attempts,
+                Backoff::new(Duration::from_millis(5), Duration::from_millis(20)),
+            ),
+            ..Default::default()
+        }))
+    }
+
+    #[tokio::test]
+    async fn push_retries_on_503_then_succeeds() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        let (url, hits) = flaky_webhook(503, 2).await;
+        let sender = retrying_sender(3);
+        sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await
+            .expect("the third attempt succeeds");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn push_retries_on_429() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        let (url, hits) = flaky_webhook(429, 1).await;
+        let sender = retrying_sender(3);
+        sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn push_does_not_retry_on_4xx() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        let (url, hits) = flaky_webhook(400, usize::MAX).await;
+        let sender = retrying_sender(5);
+        let result = sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await;
+        assert!(result.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn push_gives_up_after_max_attempts() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        let (url, hits) = flaky_webhook(500, usize::MAX).await;
+        let sender = retrying_sender(3);
+        let result = sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await;
+        assert!(result.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn push_retries_connect_errors() {
+        install_crypto_provider();
+        // Nothing listens on port 1: every attempt is a connect error.
+        let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
+            fail_on_error: true,
+            validate_urls: false,
+            retry: RetryPolicy::new(
+                3,
+                Backoff::new(Duration::from_millis(40), Duration::from_millis(40)),
+            ),
+            ..Default::default()
+        }));
+        let started = std::time::Instant::now();
+        let result = sender
+            .send_push(
+                &sample_config("http://127.0.0.1:1/callback"),
+                sample_status_update(),
+            )
+            .await;
+        assert!(result.is_err());
+        // Three attempts mean two waits, each at least half of the 40 ms
+        // backoff: a sender that made fewer attempts finishes sooner.
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "fewer than three attempts were made: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn retry_policy_backoff_is_capped_and_jittered() {
+        let policy = RetryPolicy::new(
+            10,
+            Backoff::new(Duration::from_millis(100), Duration::from_secs(1)),
+        );
+        for retry in 1..=20 {
+            let delay = policy.delay_before_retry(retry);
+            let ceiling = Duration::from_millis(100)
+                .saturating_mul(1u32 << (retry - 1).min(10))
+                .min(Duration::from_secs(1));
+            assert!(delay <= ceiling, "retry {retry}: {delay:?} > {ceiling:?}");
+            assert!(
+                delay >= ceiling / 2,
+                "retry {retry}: {delay:?} < half of {ceiling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_policy_backoff_varies_between_draws() {
+        let policy = RetryPolicy::new(
+            3,
+            Backoff::new(Duration::from_millis(100), Duration::from_secs(1)),
+        );
+        let draws: std::collections::HashSet<_> =
+            (0..200).map(|_| policy.delay_before_retry(1)).collect();
+        // A constant delay would put every retry of a failed batch at the
+        // same instant; 200 draws from a 50 ms window must not coincide.
+        assert!(draws.len() > 20, "only {} distinct delays", draws.len());
+    }
+
+    /// Webhook that answers 503 with `Retry-After: seconds` and counts hits.
+    async fn retry_after_webhook(
+        seconds: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", seconds)],
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/"), hits)
+    }
+
+    #[tokio::test]
+    async fn push_gives_up_when_retry_after_exceeds_cap() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        // The cap is 20 ms; the server asks for an hour.
+        let (url, hits) = retry_after_webhook("3600").await;
+        let sender = retrying_sender(5);
+        let started = std::time::Instant::now();
+        let result = sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await;
+        assert!(result.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "must not retry");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn push_honours_retry_after_within_the_cap() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        let (url, hits) = retry_after_webhook("1").await;
+        let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
+            fail_on_error: true,
+            validate_urls: false,
+            retry: RetryPolicy::new(
+                2,
+                Backoff::new(Duration::from_millis(5), Duration::from_secs(2)),
+            ),
+            ..Default::default()
+        }));
+        let started = std::time::Instant::now();
+        let result = sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await;
+        assert!(result.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "Retry-After: 1 was not waited for: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn push_ignores_an_http_date_retry_after() {
+        use std::sync::atomic::Ordering;
+        install_crypto_provider();
+        let (url, hits) = retry_after_webhook("Wed, 21 Oct 2037 07:28:00 GMT").await;
+        let sender = retrying_sender(2);
+        let started = std::time::Instant::now();
+        let result = sender
+            .send_push(&sample_config(&url), sample_status_update())
+            .await;
+        assert!(result.is_err());
+        // The date is ignored: the backoff alone applies and the retry happens.
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn config_defaults_include_a_connect_timeout() {
+        assert_eq!(
+            HttpPushSenderConfig::default().connect_timeout,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn retry_policy_none_makes_one_attempt() {
+        assert_eq!(RetryPolicy::none().max_attempts(), 1);
+        assert_eq!(RetryPolicy::new(0, Backoff::default()).max_attempts(), 1);
     }
 }

@@ -359,13 +359,12 @@ async fn spawn_push_http_server() -> (String, tokio::task::JoinHandle<()>) {
         task.context_id = context.to_string();
         store.create(task).await.unwrap();
     }
+    let mut push_config = HttpPushSenderConfig::default();
+    push_config.validate_urls = false;
     let handler = Arc::new(
         DefaultRequestHandler::new(PushTransportExecutor, store).with_push_notifications(
             InMemoryPushConfigStore::new(),
-            HttpPushSender::new(Some(HttpPushSenderConfig {
-                validate_urls: false,
-                ..Default::default()
-            })),
+            HttpPushSender::new(Some(push_config)),
         ),
     );
     let app = Router::new()

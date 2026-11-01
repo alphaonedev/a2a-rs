@@ -8,5 +8,5 @@ pub(crate) mod dispatcher;
 pub(crate) mod sender;
 mod store;
 
-pub use sender::{HttpPushSender, HttpPushSenderConfig};
+pub use sender::{Backoff, HttpPushSender, HttpPushSenderConfig, RetryPolicy};
 pub use store::{InMemoryPushConfigStore, PushConfigStore};

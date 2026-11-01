@@ -2073,6 +2073,7 @@ mod tests {
             crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
                 validate_urls: false,
                 fail_on_error: true,
+                retry: crate::RetryPolicy::none(),
                 ..Default::default()
             })),
         )
@@ -2272,6 +2273,27 @@ mod tests {
         fast_tx.send(()).unwrap();
         fast_srv.await.unwrap();
         elapsed
+    }
+
+    /// Webhook that asks the sender to come back in two seconds.
+    async fn retry_later_push() -> (StatusCode, [(&'static str, &'static str); 1]) {
+        (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "2")])
+    }
+
+    #[tokio::test]
+    async fn retry_waits_of_one_task_do_not_starve_other_tasks() {
+        install_crypto_provider();
+        let (slow_url, slow_tx, slow_srv) =
+            serve(Router::new().route("/", post(retry_later_push))).await;
+        // 40 configs retry for 2 s each: a permit held across the wait would
+        // keep the shared pool busy and delay the other task.
+        let elapsed = victim_first_push_latency(slow_url, 40).await;
+        slow_tx.send(()).unwrap();
+        drop(slow_srv);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a retry sleep held a delivery slot: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
