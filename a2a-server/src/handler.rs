@@ -668,11 +668,13 @@ impl DefaultRequestHandler {
         )
     }
 
-    /// The push-config store, refusing first when the card declares that the
-    /// agent does not support push notifications (§13.3). Distinct from
-    /// [`Self::push_config_store`], which reports the *deployment* state — a
-    /// store that was never supplied — with the same error code.
     /// Returns `TaskNotFound` unless the task store holds `task_id`.
+    ///
+    /// Only `create_push_config` uses this: it is the one push-config method
+    /// that allocates per task id. `get` already answers `TaskNotFound` from
+    /// the store, `list` returns an empty page, and `delete` stays idempotent
+    /// so configs left behind by a task that a custom `TaskStore` removed can
+    /// still be removed. The in-memory store never removes tasks.
     async fn require_existing_task(&self, task_id: &str) -> Result<(), A2AError> {
         match self.task_store.get(task_id).await? {
             Some(_) => Ok(()),
@@ -680,6 +682,10 @@ impl DefaultRequestHandler {
         }
     }
 
+    /// The push-config store, refusing first when the card declares that the
+    /// agent does not support push notifications (§13.3). Distinct from
+    /// [`Self::push_config_store`], which reports the *deployment* state — a
+    /// store that was never supplied — with the same error code.
     fn push_config_store_checked(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
         self.require_push_notifications()?;
         self.push_config_store()
@@ -3009,6 +3015,72 @@ mod tests {
             Ok(_) => panic!("expected subscribe_to_task to fail after completion"),
             Err(error) => assert_eq!(error.code, error_code::UNSUPPORTED_OPERATION),
         }
+    }
+
+    /// `get`, `list` and `delete` have no existence check on purpose: `get`
+    /// answers `TaskNotFound` from the store, `list` returns an empty page and
+    /// `delete` is idempotent. Pin that so the choice stays deliberate.
+    #[tokio::test]
+    async fn get_list_delete_push_config_for_unknown_task_keep_their_behaviour() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+
+        let got = handler
+            .get_push_config(
+                &params,
+                GetTaskPushNotificationConfigRequest {
+                    task_id: "no-such-task".into(),
+                    id: "cfg".into(),
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(got, Err(ref err) if err.code == A2AError::task_not_found("x").code),
+            "get on an unknown task must be TaskNotFound, got {got:?}"
+        );
+
+        let listed = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "no-such-task".into(),
+                    page_size: None,
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(listed.configs.is_empty());
+
+        handler
+            .delete_push_config(
+                &params,
+                DeleteTaskPushNotificationConfigRequest {
+                    task_id: "no-such-task".into(),
+                    id: "cfg".into(),
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Nothing was stored for the unknown task by any of the three calls.
+        let after = handler
+            .list_push_configs(
+                &params,
+                ListTaskPushNotificationConfigsRequest {
+                    task_id: "no-such-task".into(),
+                    page_size: None,
+                    page_token: None,
+                    tenant: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(after.configs.is_empty());
     }
 
     #[tokio::test]
