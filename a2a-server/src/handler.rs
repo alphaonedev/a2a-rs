@@ -2460,6 +2460,8 @@ mod tests {
                 validate_urls: false,
                 fail_on_error: true,
                 timeout: Duration::from_secs(1),
+                retry: crate::RetryPolicy::none(),
+                ..Default::default()
             })),
         );
         let params = ServiceParams::new();
@@ -2842,9 +2844,15 @@ mod tests {
         );
     }
 
-    /// Latency of the first push of an unrelated task while `slow_configs`
-    /// webhook configs of another task are busy.
-    async fn victim_first_push_latency(slow_url: String, slow_configs: usize) -> Duration {
+    /// Latency of the first push of an unrelated task while `busy_tasks`
+    /// tasks with `configs_per_task` webhook configs each are busy. One task
+    /// can use at most 4 of the 32 shared slots, so 8 tasks of 4 configs are
+    /// needed to fill the pool.
+    async fn victim_first_push_latency(
+        slow_url: String,
+        busy_tasks: usize,
+        configs_per_task: usize,
+    ) -> Duration {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let fast = Router::new()
             .route("/", post(indexed_push))
@@ -2855,24 +2863,30 @@ mod tests {
             gap: Duration::ZERO,
         });
         let params = ServiceParams::new();
-        seed_task(&handler, "t-busy", "ctx-t-busy").await;
-        for index in 0..slow_configs {
-            let mut config = push_config("t-busy");
-            config.id = Some(format!("cfg-{index}"));
-            config.url = slow_url.clone();
-            handler.create_push_config(&params, config).await.unwrap();
+        for task in 0..busy_tasks {
+            let id = format!("t-busy-{task}");
+            seed_task(&handler, &id, &format!("ctx-{id}")).await;
+            for index in 0..configs_per_task {
+                let mut config = push_config(&id);
+                config.id = Some(format!("cfg-{index}"));
+                config.url = slow_url.clone();
+                handler.create_push_config(&params, config).await.unwrap();
+            }
         }
         seed_task(&handler, "t-victim", "ctx-t-victim").await;
         let mut config = push_config("t-victim");
         config.url = fast_url;
         handler.create_push_config(&params, config).await.unwrap();
 
-        let mut events = handler
-            .send_streaming_message(&params, streaming_request("t-busy"))
-            .await
-            .unwrap();
-        while let Some(event) = events.next().await {
-            event.unwrap();
+        // Every busy task has queued its pushes before the victim starts.
+        for task in 0..busy_tasks {
+            let mut events = handler
+                .send_streaming_message(&params, streaming_request(&format!("t-busy-{task}")))
+                .await
+                .unwrap();
+            while let Some(event) = events.next().await {
+                event.unwrap();
+            }
         }
         let started = std::time::Instant::now();
         let mut events = handler
@@ -2902,9 +2916,10 @@ mod tests {
         install_crypto_provider();
         let (slow_url, slow_tx, slow_srv) =
             serve(Router::new().route("/", post(retry_later_push))).await;
-        // 40 configs retry for 2 s each: a permit held across the wait would
-        // keep the shared pool busy and delay the other task.
-        let elapsed = victim_first_push_latency(slow_url, 40).await;
+        // 10 tasks x 5 configs retry for 2 s each (50 waits, more than the 32
+        // shared slots): a permit held across the wait would fill the pool
+        // and delay the other task.
+        let elapsed = victim_first_push_latency(slow_url, 10, 5).await;
         slow_tx.send(()).unwrap();
         drop(slow_srv);
         assert!(
@@ -2920,7 +2935,7 @@ mod tests {
             .route("/", post(slow_push))
             .with_state(Duration::from_secs(3));
         let (slow_url, slow_tx, slow_srv) = serve(slow).await;
-        let elapsed = victim_first_push_latency(slow_url, 40).await;
+        let elapsed = victim_first_push_latency(slow_url, 1, 40).await;
         slow_tx.send(()).unwrap();
         drop(slow_srv);
         assert!(

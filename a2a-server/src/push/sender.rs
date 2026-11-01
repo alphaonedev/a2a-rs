@@ -1367,6 +1367,64 @@ mod tests {
         );
     }
 
+    /// A listener whose accept queue is full never completes a new
+    /// connection, so each attempt ends at `connect_timeout` (200 ms), long
+    /// before the 30 s request timeout; the policy retries each of them. Three
+    /// attempts therefore take at least 3 x 200 ms and, with backoff of at
+    /// most 20 ms between them, well under the sum of the bounds plus slack.
+    #[tokio::test]
+    async fn connect_timeout_ends_each_attempt_and_is_retried() {
+        install_crypto_provider();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Fill the accept queue (never accepted); the last connects hang.
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            if let Ok(Ok(stream)) = tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                held.push(stream);
+            }
+        }
+        let connect_timeout = Duration::from_millis(200);
+        let backoff_max = Duration::from_millis(20);
+        let attempts = 3u32;
+        let sender = HttpPushSender::new(Some(HttpPushSenderConfig {
+            fail_on_error: true,
+            validate_urls: false,
+            connect_timeout,
+            retry: RetryPolicy::new(
+                attempts,
+                Backoff::new(Duration::from_millis(5), backoff_max),
+            ),
+            ..Default::default()
+        }));
+        let started = std::time::Instant::now();
+        let result = sender
+            .send_push(
+                &sample_config(&format!("http://{addr}/callback")),
+                sample_status_update(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert!(
+            elapsed >= connect_timeout * attempts,
+            "fewer than {attempts} attempts ended at the connect timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < (connect_timeout + backoff_max) * attempts + Duration::from_secs(1),
+            "an attempt outlived the connect timeout: {elapsed:?}"
+        );
+        drop(held);
+        drop(listener);
+    }
+
     #[test]
     fn retry_policy_none_makes_one_attempt() {
         assert_eq!(RetryPolicy::none().max_attempts(), 1);
