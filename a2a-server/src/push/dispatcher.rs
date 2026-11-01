@@ -19,13 +19,23 @@
 //!   ended; the real bound on a queue is therefore the capacity plus one
 //!   terminal event per execution or cancellation.
 //! * A task delivers to at most [`MAX_CONCURRENT_PUSH_DELIVERIES_PER_TASK`]
-//!   of its webhooks at once.
+//!   of its webhooks at once. Both limits are crate-internal constants in
+//!   this release; there is no public setter.
 //! * At most [`MAX_CONCURRENT_PUSH_DELIVERIES`] webhook requests are in flight
-//!   at once across all tasks. That pool is shared, so with many busy tasks it
-//!   still bounds the total throughput by design. A request holds a slot only
-//!   while it is in flight, never while a delivery waits to retry, and a
-//!   single task can never hold more than its per-task share, so a slow task
-//!   cannot delay another task's pushes by more than the time of one request.
+//!   at once across all tasks. A request holds a slot only while it is in
+//!   flight, so a single task holds at most its per-task share (4 of 32). One
+//!   slow task therefore delays another task's pushes by no more than about
+//!   one request time. The pool is shared, so with `T` slow tasks the
+//!   shares add up: once `4 * T` reaches 32 (`T >= 8`) a newcomer waits for a
+//!   slot, which is about `ceil(4 * T / 32)` request times (measured: 8 slow
+//!   tasks of 4 slow webhooks each delay a newcomer by about one request
+//!   time).
+//! * A caller that waits for a task's pushes (a strict sender, see
+//!   [`HttpPushSender`]'s `fail_on_error`) waits behind everything already
+//!   queued for the task: up to [`PUSH_QUEUE_CAPACITY_PER_TASK`] events x
+//!   `ceil(configs / 4)` x the time of one request, unless a failure is
+//!   recorded first; the failure ends the wait and the jobs queued behind it
+//!   are skipped.
 //! * The worker for a task is removed in the same critical section that finds
 //!   its queue empty, so a later event for the task starts a new worker and
 //!   two workers for one task never overlap. A panic inside a delivery is
@@ -40,6 +50,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use a2a::{A2AError, StreamResponse};
@@ -95,6 +106,9 @@ pub(crate) struct PushJob {
     /// Notified of the first failure for this event, if anyone cares. Not
     /// called when `done` is set: the outcome goes to `done` instead.
     pub(crate) on_error: Option<PushErrorSink>,
+    /// When set to true the job is skipped: its requests are not sent and its
+    /// outcome is `Ok`. A strict execution sets it at its first failure.
+    pub(crate) abandon: Option<Arc<AtomicBool>>,
     /// Receives the outcome of this job, for a caller that waits for it.
     pub(crate) done: Option<PushDone>,
 }
@@ -197,11 +211,15 @@ impl PushDispatcher {
             store,
             sender,
             on_error,
+            abandon,
             done,
             ..
         } = job;
         let outcome = match event {
-            Some(event) => self.deliver_event(task_id, event, store, sender).await,
+            Some(event) => {
+                self.deliver_event(task_id, event, store, sender, abandon)
+                    .await
+            }
             None => None,
         };
         match (done, outcome) {
@@ -220,7 +238,16 @@ impl PushDispatcher {
         event: StreamResponse,
         store: Arc<dyn PushConfigStore>,
         sender: Arc<HttpPushSender>,
+        abandon: Option<Arc<AtomicBool>>,
     ) -> Option<A2AError> {
+        let abandoned = || {
+            abandon
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+        };
+        if abandoned() {
+            return None;
+        }
         let configs = match store.list(task_id).await {
             Ok(configs) => configs,
             Err(error) => {
@@ -238,7 +265,13 @@ impl PushDispatcher {
                 let sender = Arc::clone(&sender);
                 let permits = Arc::clone(&self.permits);
                 let event = event.clone();
-                async move { sender.send_push_gated(&config, event, Some(&permits)).await }
+                let skip = abandoned();
+                async move {
+                    if skip {
+                        return Ok(());
+                    }
+                    sender.send_push_gated(&config, event, Some(&permits)).await
+                }
             })
             .buffer_unordered(self.per_task)
             .collect::<Vec<_>>()
@@ -288,12 +321,16 @@ mod tests {
     }
 
     fn job(store: Arc<dyn PushConfigStore>) -> PushJob {
+        // Building an HTTP client is expensive; the tests that enqueue
+        // thousands of jobs share one sender.
+        static SENDER: std::sync::OnceLock<Arc<HttpPushSender>> = std::sync::OnceLock::new();
         PushJob {
             event: Some(working_task()),
             terminal: false,
             store,
-            sender: Arc::new(HttpPushSender::new(None)),
+            sender: Arc::clone(SENDER.get_or_init(|| Arc::new(HttpPushSender::new(None)))),
             on_error: None,
+            abandon: None,
             done: None,
         }
     }
@@ -444,6 +481,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_abandoned_job_is_not_delivered() {
+        let dispatcher = PushDispatcher::new();
+        let store = Arc::new(GatedStore {
+            release: tokio::sync::Notify::new(),
+            lists: AtomicUsize::new(0),
+        });
+        let dyn_store: Arc<dyn PushConfigStore> = store.clone();
+        let (tx, rx) = oneshot::channel();
+        let mut j = job(dyn_store);
+        j.abandon = Some(Arc::new(AtomicBool::new(true)));
+        j.done = Some(tx);
+        dispatcher.enqueue("t", j);
+        // The store would block forever in `list`; the job completes without
+        // ever reaching it.
+        outcome(rx).await.unwrap();
+        assert_eq!(store.lists.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn a_full_queue_drops_non_terminal_events_and_keeps_terminal_ones() {
         let dispatcher = PushDispatcher::new();
         let store = Arc::new(GatedStore {
@@ -469,6 +525,7 @@ mod tests {
                         counter.fetch_add(1, Ordering::SeqCst);
                     }
                 })),
+                abandon: None,
                 done,
             }
         };
