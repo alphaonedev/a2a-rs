@@ -161,26 +161,40 @@ pub struct HttpPushSenderConfig {
     /// A connect timeout counts as a connect error and is retried according to
     /// [`Self::retry`]; [`Self::timeout`] still bounds the whole request.
     pub connect_timeout: Duration,
-    /// If true, push sending errors are returned from
-    /// [`HttpPushSender::send_push`] instead of only being logged.
+    /// If true, push delivery errors reach the caller instead of only being
+    /// logged.
     ///
     /// [`DefaultRequestHandler`](crate::DefaultRequestHandler) delivers
-    /// pushes on a background queue, so while the flag is off an error never
-    /// delays or fails the event that caused it and is only logged. With the
-    /// flag on, every failure reaches the caller:
+    /// pushes on a background queue. Two kinds of error exist:
     ///
-    /// * a failure noticed while the execution is still running is recorded
-    ///   and ends the execution with an error to its subscribers at the next
-    ///   event after it was recorded, not necessarily the next event;
-    /// * the terminal event, and the end of an execution that stopped without
-    ///   one, wait for the pending deliveries of the task, so a failure of the
-    ///   last push is published as the final error instead of the event
-    ///   (a latency cost that strict mode opts into, bounded by the request
-    ///   timeout);
-    /// * an event dropped because the task's push queue was full is reported
-    ///   as an error naming the full queue;
-    /// * `cancel_task` waits for the delivery of the cancellation events and
-    ///   returns the error, as it did before deliveries moved to a queue.
+    /// * Errors known before any request is sent (the push URL checks, the
+    ///   CR/LF header checks, a config store that cannot be read) fail the
+    ///   event synchronously whatever this flag says, as they did when
+    ///   delivery was inline. They are checked against the configs the task
+    ///   has when the event is queued; a config added after the event was
+    ///   queued is checked at delivery, and its errors follow the delivery
+    ///   rule below.
+    /// * Delivery errors (a refused connection, a timeout, a non-success
+    ///   status, a full queue, a failed delivery worker) are logged while the
+    ///   flag is off and never delay or fail the event that caused them. With
+    ///   the flag on they reach the caller:
+    ///   * the execution stops at the first failed request: the error is
+    ///     reported as soon as that request fails, without waiting for the
+    ///     other configs of the event (their requests are cancelled or never
+    ///     started), pushes still queued behind it are skipped, and the
+    ///     stream ends with the error. A failure noticed while events are
+    ///     still arriving ends the execution at the next event after it was
+    ///     recorded, not necessarily the next event;
+    ///   * the terminal event and the end of a run that stopped without one
+    ///     wait until every push already queued for the task, their own
+    ///     included, has been delivered or a failure is recorded; a
+    ///     cancellation waits for all of them and returns the first error
+    ///     (a failure recorded by a concurrent execution does not shorten
+    ///     the cancellation's wait). That is a latency cost strict mode opts
+    ///     into. With no failure the wait can reach the queue depth (64) x
+    ///     ceil(configs / 4) x the time of one request;
+    ///   * an event dropped because the task's queue was full is reported as
+    ///     an error naming the full queue.
     pub fail_on_error: bool,
     /// If true (default), guard push URLs against SSRF. A string pre-check
     /// (scheme must be http/https; host must not be a loopback, private,
@@ -251,6 +265,33 @@ impl HttpPushSender {
         self.fail_on_error
     }
 
+    /// The checks that need no request: the URL guard (when enabled) and the
+    /// CR/LF checks on credentials, so they cannot inject additional headers
+    /// into the outgoing request (BUG-34). Run before an event is queued and
+    /// again before every send.
+    pub(crate) fn precheck(&self, config: &TaskPushNotificationConfig) -> Result<(), A2AError> {
+        if self.validate_urls {
+            validate_push_url(&config.url)?;
+        }
+        if let Some(ref token) = config.token {
+            if token.contains('\r') || token.contains('\n') {
+                return Err(A2AError::invalid_params(
+                    "push notification token must not contain CR/LF",
+                ));
+            }
+        }
+        if let Some(ref auth) = config.authentication {
+            if let Some(ref creds) = auth.credentials {
+                if creds.contains('\r') || creds.contains('\n') {
+                    return Err(A2AError::invalid_params(
+                        "push credentials must not contain CR/LF",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Send an event to the push notification endpoint.
     pub async fn send_push(
         &self,
@@ -271,28 +312,7 @@ impl HttpPushSender {
         event: StreamResponse,
         gate: Option<&tokio::sync::Semaphore>,
     ) -> Result<(), A2AError> {
-        if self.validate_urls {
-            validate_push_url(&config.url)?;
-        }
-
-        // Reject credentials containing CR/LF so they cannot inject
-        // additional headers into the outgoing request (BUG-34).
-        if let Some(ref token) = config.token {
-            if token.contains('\r') || token.contains('\n') {
-                return Err(A2AError::invalid_params(
-                    "push notification token must not contain CR/LF",
-                ));
-            }
-        }
-        if let Some(ref auth) = config.authentication {
-            if let Some(ref creds) = auth.credentials {
-                if creds.contains('\r') || creds.contains('\n') {
-                    return Err(A2AError::invalid_params(
-                        "push credentials must not contain CR/LF",
-                    ));
-                }
-            }
-        }
+        self.precheck(config)?;
 
         let body = match serde_json::to_vec(&event) {
             Ok(b) => b,
