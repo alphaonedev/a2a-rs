@@ -188,12 +188,15 @@ pub struct HttpPushSenderConfig {
     ///   * the terminal event and the end of a run that stopped without one
     ///     wait until every push already queued for the task, their own
     ///     included, has been delivered or a failure is recorded; a
-    ///     cancellation waits for all of them and returns the first error
-    ///     (a failure recorded by a concurrent execution does not shorten
-    ///     the cancellation's wait). That is a latency cost strict mode opts
-    ///     into. With no failure the wait can reach the queue depth (64) x
-    ///     ceil(configs / 4) x the time of one request (with retries: the
-    ///     request timeout x the attempts, plus the backoff between them);
+    ///     cancellation waits for the pushes queued ahead of its own (pushes
+    ///     that a recorded strict failure abandoned are skipped, which can
+    ///     shorten the wait), then for its own push, which stops at its
+    ///     first failed request, and returns that error; errors of pushes
+    ///     the execution queued earlier go to that execution. That is a
+    ///     latency cost strict mode opts into. With no failure the wait can
+    ///     reach the queue depth (64) x ceil(configs / 4) x the time of one
+    ///     request (with retries: the request timeout x the attempts, plus
+    ///     the backoff between them);
     ///   * an event dropped because the task's queue was full is reported as
     ///     an error naming the full queue.
     pub fail_on_error: bool,
