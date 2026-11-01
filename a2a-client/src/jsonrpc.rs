@@ -2361,7 +2361,7 @@ mod tests {
     /// Hostile variant: 1 MiB of minimal (empty) events in one read. Every
     /// event reaches the parse callback exactly once, nothing is delivered,
     /// and the parser touches at most `MAX_WORK_PER_INPUT_BYTE` times the
-    /// input length (deterministic: the old parser moved about 2.6e11 bytes
+    /// input length (deterministic: the old parser moved about 2.7e11 bytes
     /// here). A secondary wall-clock bound of 1 s guards the same stream.
     #[tokio::test]
     async fn test_sse_one_mib_of_minimal_events_work_is_linear() {
