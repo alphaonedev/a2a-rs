@@ -33,20 +33,20 @@
 //! * A caller that waits for a task's pushes (a strict sender, see
 //!   [`HttpPushSender`]'s `fail_on_error`) waits behind everything already
 //!   queued for the task: up to [`PUSH_QUEUE_CAPACITY_PER_TASK`] events x
-//!   `ceil(configs / 4)` x the time of one request (with retries: the
-//!   request timeout x the attempts plus the backoff), unless a failure is
-//!   recorded first. A strict job reports its first failed request at once:
-//!   the other requests of the event are cancelled or never started, the
-//!   caller's error sink abandons the jobs queued behind it, and nothing is
-//!   awaited after that first error. The failure is known about one request
-//!   time (with retries, one request's attempts and backoff) after the failed
-//!   request was sent. Requests of the same event that started earlier are
-//!   still awaited if they succeed, and the failing request starts only when
-//!   one of the task's slots is free, up to `floor(k / 4)` request times after
-//!   the first request of the event for `k` configs ahead of it, so the
-//!   failure can come up to `floor(k / 4) + 1` request times after that first
-//!   request (`floor(k / 4)` when the failure is immediate). An execution that
-//!   is abandoned (a failure or a queue-full report was recorded) also stops
+//!   `ceil(configs / 4)` x the time of one request (with retries: the request
+//!   timeout x the attempts plus the backoff), unless a failure is recorded
+//!   first. A strict job reports its first failed request at once: the other
+//!   requests of the event are cancelled or never started, the caller's error
+//!   sink abandons the jobs queued behind it, and nothing is awaited after
+//!   that first error. The failure is known about one request time (with
+//!   retries, one request's attempts and backoff) after the failed request was
+//!   sent. Requests of the same event that started earlier are still awaited
+//!   if they succeed, and the failing request starts only when one of the
+//!   task's slots is free, up to `floor(k / 4)` request times after the first
+//!   request of the event for `k` configs ahead of it, so the failure can come
+//!   up to `floor(k / 4) + 1` request times after that first request
+//!   (`floor(k / 4)` when the failure is immediate). An execution that is
+//!   abandoned (a failure or a queue-full report was recorded) also stops
 //!   starting the remaining requests of an event that is already in flight: a
 //!   queue-full report can arrive while an earlier event is being delivered,
 //!   and then no further request of that event begins.
