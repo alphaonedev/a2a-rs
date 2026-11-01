@@ -1205,11 +1205,15 @@ impl RequestHandler for DefaultRequestHandler {
 
                     // Delivery is queued: a slow or failing webhook can
                     // neither delay nor fail the cancellation, unless the
-                    // sender is strict (`fail_on_error`), in which case the
-                    // cancellation waits for every push already queued for
-                    // the task, its own included, and returns the error.
-                    // Errors known before a request is sent fail the
-                    // cancellation in both modes.
+                    // sender is strict (`fail_on_error`). Then a
+                    // cancellation waits for the pushes queued ahead of its
+                    // own (pushes that a recorded strict failure abandoned
+                    // are skipped, which can shorten the wait), then for its
+                    // own push, which stops at its first failed request, and
+                    // returns that error; errors of pushes the execution
+                    // queued earlier go to that execution. Errors known
+                    // before a request is sent fail the cancellation in both
+                    // modes.
                     precheck_push(
                         self.push_config_store.as_ref(),
                         self.push_sender.as_ref(),
@@ -2481,9 +2485,13 @@ mod tests {
     }
 
     /// 32 configs on a webhook that never answers, a 1 s request timeout and
-    /// ten queued events: the execution ends with the error one request time
-    /// after the first request was sent (4 requests at a time), bounded here
-    /// by 1.8 s. Waiting for every config of the event would take
+    /// ten queued events: every request fails at its own timeout, and the
+    /// execution ends with the error one request time after the failed
+    /// requests were sent (the first 4 start together and none succeeds, so
+    /// nothing earlier is still awaited), bounded here by 1.8 s. With
+    /// successful requests of the same event ahead of the failure it can take
+    /// up to floor(k / 4) + 1 request times for k configs ahead of the failing
+    /// request. Waiting for every config of the event would take
     /// ceil(32 / 4) = 8 request times (8 s), the whole queue far longer.
     #[tokio::test]
     async fn strict_failure_ends_the_execution_promptly() {
@@ -2647,6 +2655,320 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "pushes queued behind the failure were still delivered"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// One task with 8 configs on a webhook that answers after 1 s, and 70
+    /// events a millisecond apart. The first event is in flight (4 requests
+    /// started, the other 4 waiting for a free slot of the task) when the
+    /// queue is full and one event is dropped and reported. The report
+    /// abandons the execution, so the 4 requests of the first event that had
+    /// not started are skipped: 4 requests in all, not 8. The stream ends with
+    /// the queue-full error.
+    #[tokio::test]
+    async fn a_queue_full_report_stops_the_requests_of_the_event_in_flight() {
+        install_crypto_provider();
+        async fn slow_count(State(hits): State<Arc<AtomicI32>>) -> StatusCode {
+            hits.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            StatusCode::ACCEPTED
+        }
+        let hits = Arc::new(AtomicI32::new(0));
+        let app = Router::new()
+            .route("/", post(slow_count))
+            .with_state(Arc::clone(&hits));
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = strict_push_handler(IndexedEventsExecutor {
+            count: 70,
+            gap: Duration::from_millis(1),
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-inflight", "ctx-t-inflight").await;
+        for index in 0..8 {
+            let mut config = push_config("t-inflight");
+            config.id = Some(format!("cfg-{index}"));
+            config.url = url.clone();
+            handler.create_push_config(&params, config).await.unwrap();
+        }
+
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-inflight"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let error = events
+            .last()
+            .and_then(|event| event.as_ref().err())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the stream did not end with an error: {} events",
+                    events.len()
+                )
+            });
+        assert!(
+            error.message.contains("push notification queue full"),
+            "{error:?}"
+        );
+
+        // Time for the second group of 4 requests, if it were started.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            4,
+            "requests of the event in flight were started after the execution was abandoned"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// One config fails at once and its sibling answers after 1.5 s. The
+    /// cancellation's own push stops at its first failed request, so the
+    /// cancellation returns that error without waiting for the sibling.
+    #[tokio::test]
+    async fn cancel_returns_the_first_failed_request_of_its_own_push() {
+        install_crypto_provider();
+        async fn reject() -> StatusCode {
+            StatusCode::BAD_REQUEST
+        }
+        async fn slow() -> StatusCode {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            StatusCode::ACCEPTED
+        }
+        let (url, shutdown_tx, server) = serve(
+            Router::new()
+                .route("/fail", post(reject))
+                .route("/slow", post(slow)),
+        )
+        .await;
+        let handler = strict_push_handler(PushEventExecutor);
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cstop", "ctx-t-cstop").await;
+        for (id, path) in [("a-slow", "slow"), ("b-fail", "fail")] {
+            let mut config = push_config("t-cstop");
+            config.id = Some(id.into());
+            config.url = format!("{url}{path}");
+            handler.create_push_config(&params, config).await.unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let result = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cstop".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "the cancellation waited for the sibling request: {elapsed:?}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// Five pushes of a running execution are queued ahead of a cancellation,
+    /// on a webhook that answers after 400 ms; the first request fails, which
+    /// the execution records. The four pushes that the failure abandoned are
+    /// skipped, so the cancellation waits for the first one and for its own
+    /// (2 requests, not 6), and returns its own outcome, which is success:
+    /// the error of the earlier push went to the execution.
+    #[tokio::test]
+    async fn cancel_skips_the_pushes_a_recorded_strict_failure_abandoned() {
+        install_crypto_provider();
+        async fn fail_first(State(hits): State<Arc<AtomicI32>>) -> StatusCode {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::ACCEPTED
+            }
+        }
+        let hits = Arc::new(AtomicI32::new(0));
+        let app = Router::new()
+            .route("/", post(fail_first))
+            .with_state(Arc::clone(&hits));
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = strict_push_handler(PushEventExecutor);
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cabandon", "ctx-t-cabandon").await;
+        let mut config = push_config("t-cabandon");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        // The running execution: it owns the abandon flag and the sink.
+        let active = ActiveExecution::new(Task {
+            id: "t-cabandon".into(),
+            context_id: "ctx-t-cabandon".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        });
+        let sink: PushErrorSink = {
+            let active = Arc::clone(&active);
+            Arc::new(move |error| active.record_push_failure(error))
+        };
+        let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+            task_id: "t-cabandon".into(),
+            context_id: "ctx-t-cabandon".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            metadata: None,
+        });
+        for _ in 0..5 {
+            enqueue_push(
+                &handler.push_dispatcher,
+                "t-cabandon",
+                handler.push_config_store.as_ref(),
+                handler.push_sender.as_ref(),
+                Some(&working),
+                Some(Arc::clone(&sink)),
+                Some(Arc::clone(&active.push_abandoned)),
+                false,
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let result = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cabandon".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "pushes of the failed execution were not skipped"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1600),
+            "the cancellation waited for the abandoned pushes: {elapsed:?}"
+        );
+        assert!(active.take_push_failure().is_some());
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// The in-memory store, listing a task's configs in the order of their
+    /// ids instead of in hash order.
+    struct SortedPushConfigStore(InMemoryPushConfigStore);
+
+    #[async_trait]
+    impl PushConfigStore for SortedPushConfigStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.0.save(config).await
+        }
+        async fn get(
+            &self,
+            task_id: &str,
+            config_id: &str,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            self.0.get(task_id, config_id).await
+        }
+        async fn list(&self, task_id: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            let mut configs = self.0.list(task_id).await?;
+            configs.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(configs)
+        }
+        async fn delete(&self, task_id: &str, config_id: &str) -> Result<(), A2AError> {
+            self.0.delete(task_id, config_id).await
+        }
+        async fn delete_all(&self, task_id: &str) -> Result<(), A2AError> {
+            self.0.delete_all(task_id).await
+        }
+    }
+
+    /// 40 configs answer after 300 ms and one fails at once. A store that
+    /// lists them in a fixed order puts the failing config last, the worst
+    /// case: its request starts only when a slot frees up after
+    /// floor(40 / 4) = 10 request times, it fails at once, and nothing is
+    /// awaited after it, so the run ends within 11 request times (11 x
+    /// 300 ms) plus 1500 ms of slack for a loaded host.
+    #[tokio::test]
+    async fn a_failure_behind_slow_successful_configs_is_known_within_the_documented_bound() {
+        install_crypto_provider();
+        async fn slow_ok() -> StatusCode {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            StatusCode::ACCEPTED
+        }
+        async fn reject() -> StatusCode {
+            StatusCode::BAD_REQUEST
+        }
+        let (url, shutdown_tx, server) = serve(
+            Router::new()
+                .route("/ok", post(slow_ok))
+                .route("/fail", post(reject)),
+        )
+        .await;
+        let handler = DefaultRequestHandler::new(
+            IndexedEventsExecutor {
+                count: 0,
+                gap: Duration::ZERO,
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            SortedPushConfigStore(InMemoryPushConfigStore::new()),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                validate_urls: false,
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-behind", "ctx-t-behind").await;
+        for index in 0..41 {
+            let mut config = push_config("t-behind");
+            config.id = Some(format!("cfg-{index:02}"));
+            let path = if index == 40 { "fail" } else { "ok" };
+            config.url = format!("{url}{path}");
+            handler.create_push_config(&params, config).await.unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-behind"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed = started.elapsed();
+
+        eprintln!("failure behind 40 slow successful configs: {elapsed:?}");
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(
+            elapsed < Duration::from_millis(11 * 300 + 1500),
+            "the failure was not known within the documented bound: {elapsed:?}"
         );
 
         shutdown_tx.send(()).unwrap();

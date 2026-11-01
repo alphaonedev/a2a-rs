@@ -37,8 +37,18 @@
 //!   recorded first. A strict job reports its first failed request at once:
 //!   the other requests of the event are cancelled or never started, the
 //!   caller's error sink abandons the jobs queued behind it, and nothing is
-//!   awaited after that first error, so the failure is known about one
-//!   request time after the first request of the failing event was sent.
+//!   awaited after that first error. The failure is known about one request
+//!   time after the failed request was sent. Requests of the same event that
+//!   started earlier are still awaited if they succeed, and the failing
+//!   request starts only when one of the task's slots is free, up to
+//!   `floor(k / 4)` request times after the first request of the event for `k`
+//!   configs ahead of it, so the failure can come up to `floor(k / 4) + 1`
+//!   request times after that first request (`floor(k / 4)` when the failure
+//!   is immediate). An execution that is abandoned (a failure or a queue-full
+//!   report was recorded) also stops starting the remaining requests of an
+//!   event that is already in flight: a queue-full report can arrive while an
+//!   earlier event is being delivered, and then no further request of that
+//!   event begins.
 //! * The worker for a task is removed in the same critical section that finds
 //!   its queue empty, so a later event for the task starts a new worker and
 //!   two workers for one task never overlap. A panic inside a delivery is
@@ -268,6 +278,10 @@ impl PushDispatcher {
                 let sender = Arc::clone(&sender);
                 let permits = Arc::clone(&self.permits);
                 let event = event.clone();
+                // Checked when the config is taken from the list, not when
+                // the job started: a queue-full report from the enqueueing
+                // side can abandon the execution while this event is in
+                // flight, and the configs not yet started are then skipped.
                 let skip = abandoned();
                 async move {
                     if skip {
@@ -578,5 +592,112 @@ mod tests {
         });
         outcome(rx).await.unwrap();
         pump.abort();
+    }
+
+    /// A store that lists the same configs every time.
+    struct ListingStore(Vec<TaskPushNotificationConfig>);
+
+    #[async_trait]
+    impl PushConfigStore for ListingStore {
+        async fn save(
+            &self,
+            config: TaskPushNotificationConfig,
+        ) -> Result<TaskPushNotificationConfig, A2AError> {
+            Ok(config)
+        }
+        async fn get(&self, _t: &str, c: &str) -> Result<TaskPushNotificationConfig, A2AError> {
+            Err(A2AError::task_not_found(c))
+        }
+        async fn list(&self, _t: &str) -> Result<Vec<TaskPushNotificationConfig>, A2AError> {
+            Ok(self.0.clone())
+        }
+        async fn delete(&self, _t: &str, _c: &str) -> Result<(), A2AError> {
+            Ok(())
+        }
+        async fn delete_all(&self, _t: &str) -> Result<(), A2AError> {
+            Ok(())
+        }
+    }
+
+    fn config_for(url: &str, id: &str, token: Option<&str>) -> TaskPushNotificationConfig {
+        TaskPushNotificationConfig {
+            task_id: "t".into(),
+            url: url.into(),
+            id: Some(id.into()),
+            token: token.map(ToOwned::to_owned),
+            authentication: None,
+            tenant: None,
+        }
+    }
+
+    /// A lenient sender collects every result of an event: a config that
+    /// fails the pre-request check at delivery time (it was added, or the
+    /// store changed, after the event was queued) must not cancel the
+    /// requests to the other configs of that event. The good webhook answers
+    /// after 100 ms and counts only completed requests, so a request that was
+    /// dropped midway shows as a missing hit, in either list order.
+    #[tokio::test]
+    async fn lenient_delivery_goes_on_after_a_config_fails_its_check() {
+        use axum::{extract::State, http::StatusCode, routing::post};
+        crate::test_util::install_crypto_provider();
+        async fn slow_ok(State(hits): State<Arc<AtomicUsize>>) -> StatusCode {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            hits.fetch_add(1, Ordering::SeqCst);
+            StatusCode::ACCEPTED
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route("/", post(slow_ok))
+            .with_state(Arc::clone(&hits));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let sender = Arc::new(HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+            validate_urls: false,
+            fail_on_error: false,
+            ..Default::default()
+        })));
+        let good = config_for(&url, "good", None);
+        // A token with a line break fails the sender's check without a request.
+        let bad = config_for(&url, "bad", Some("a\r\nb"));
+        let mut expected = 0;
+        for configs in [vec![good.clone(), bad.clone()], vec![bad, good]] {
+            let dispatcher = PushDispatcher::new();
+            let (tx, rx) = oneshot::channel();
+            dispatcher.enqueue(
+                "t",
+                PushJob {
+                    event: Some(working_task()),
+                    terminal: false,
+                    store: Arc::new(ListingStore(configs)),
+                    sender: Arc::clone(&sender),
+                    on_error: None,
+                    abandon: None,
+                    done: Some(tx),
+                },
+            );
+            // The job reports the failed check, and the good webhook still
+            // received the event.
+            let error = outcome(rx).await.unwrap_err();
+            assert!(error.message.contains("CR/LF"), "{error:?}");
+            expected += 1;
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                expected,
+                "the good config did not receive the event"
+            );
+        }
+
+        stop.send(()).unwrap();
+        server.await.unwrap();
     }
 }
