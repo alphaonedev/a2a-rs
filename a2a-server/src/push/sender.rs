@@ -29,23 +29,29 @@ pub struct HttpPushSenderConfig {
     /// * Errors known before any request is sent (the push URL checks, the
     ///   CR/LF header checks, a config store that cannot be read) fail the
     ///   event synchronously whatever this flag says, as they did when
-    ///   delivery was inline.
+    ///   delivery was inline. They are checked against the configs the task
+    ///   has when the event is queued; a config added after the event was
+    ///   queued is checked at delivery, and its errors follow the delivery
+    ///   rule below.
     /// * Delivery errors (a refused connection, a timeout, a non-success
     ///   status, a full queue, a failed delivery worker) are logged while the
     ///   flag is off and never delay or fail the event that caused them. With
     ///   the flag on they reach the caller:
-    ///   * the execution stops at the first recorded failure: the failure
-    ///     wakes any wait immediately, pushes still queued behind it are
-    ///     skipped, and the stream ends with the error. A failure noticed
-    ///     while events are still arriving ends the execution at the next
-    ///     event after it was recorded, not necessarily the next event;
-    ///   * the terminal event, the end of a run that stopped without one, and
-    ///     a cancellation wait until every push already queued for the task,
-    ///     their own included, has been delivered (or a failure is known).
-    ///     That is a latency cost strict mode opts into. With no failure the
-    ///     wait can reach the queue depth (64) x ceil(configs / 4) x the time
-    ///     of one request (with retries: request timeout x attempts plus
-    ///     backoff);
+    ///   * the execution stops at the first failed request: the error is
+    ///     reported as soon as that request fails, without waiting for the
+    ///     other configs of the event (their requests are cancelled or never
+    ///     started), pushes still queued behind it are skipped, and the
+    ///     stream ends with the error. A failure noticed while events are
+    ///     still arriving ends the execution at the next event after it was
+    ///     recorded, not necessarily the next event;
+    ///   * the terminal event and the end of a run that stopped without one
+    ///     wait until every push already queued for the task, their own
+    ///     included, has been delivered or a failure is recorded; a
+    ///     cancellation waits for all of them and returns the first error
+    ///     (a failure recorded by a concurrent execution does not shorten
+    ///     the cancellation's wait). That is a latency cost strict mode opts
+    ///     into. With no failure the wait can reach the queue depth (64) x
+    ///     ceil(configs / 4) x the time of one request;
     ///   * an event dropped because the task's queue was full is reported as
     ///     an error naming the full queue.
     pub fail_on_error: bool,

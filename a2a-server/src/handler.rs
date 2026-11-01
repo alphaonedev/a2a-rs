@@ -2432,12 +2432,13 @@ mod tests {
         assert!(!completed_task_event(&events), "{events:?}");
     }
 
-    /// Several configs on a webhook that never answers, a short request
-    /// timeout and many queued events: once the first failure is recorded the
-    /// execution ends within about one request time, not after the whole
-    /// queue (8 configs x 11 events at 4 at a time x 1 s is about 22 s).
-    #[tokio::test]
-    async fn strict_failure_ends_the_execution_promptly() {
+    /// A strict sender with a 1 s request timeout and `configs` configs on a
+    /// webhook that never answers, with ten events queued. Returns the
+    /// stream and how long it took to end.
+    async fn strict_run_against_a_silent_webhook(
+        task_id: &str,
+        configs: usize,
+    ) -> (Vec<Result<StreamResponse, A2AError>>, Duration) {
         install_crypto_provider();
         async fn never_answers() -> StatusCode {
             tokio::time::sleep(Duration::from_secs(60)).await;
@@ -2461,9 +2462,9 @@ mod tests {
             })),
         );
         let params = ServiceParams::new();
-        seed_task(&handler, "t-prompt", "ctx-t-prompt").await;
-        for index in 0..8 {
-            let mut config = push_config("t-prompt");
+        seed_task(&handler, task_id, &format!("ctx-{task_id}")).await;
+        for index in 0..configs {
+            let mut config = push_config(task_id);
             config.id = Some(format!("cfg-{index}"));
             config.url = url.clone();
             handler.create_push_config(&params, config).await.unwrap();
@@ -2471,7 +2472,80 @@ mod tests {
 
         let started = std::time::Instant::now();
         let events = handler
-            .send_streaming_message(&params, streaming_request("t-prompt"))
+            .send_streaming_message(&params, streaming_request(task_id))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        (events, started.elapsed())
+    }
+
+    /// 32 configs on a webhook that never answers, a 1 s request timeout and
+    /// ten queued events: the execution ends with the error one request time
+    /// after the first request was sent (4 requests at a time), bounded here
+    /// by 1.8 s. Waiting for every config of the event would take
+    /// ceil(32 / 4) = 8 request times (8 s), the whole queue far longer.
+    #[tokio::test]
+    async fn strict_failure_ends_the_execution_promptly() {
+        let (events, elapsed) = strict_run_against_a_silent_webhook("t-prompt", 32).await;
+
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(!completed_task_event(&events), "{events:?}");
+        assert!(
+            elapsed < Duration::from_millis(1800),
+            "a strict failure did not end the execution within one request time \
+             (32 configs, 1 s timeout): {elapsed:?}"
+        );
+    }
+
+    /// The same with 16 configs, bounded by 1.5 s (4 request times if the
+    /// event were awaited whole).
+    #[tokio::test]
+    async fn strict_failure_with_16_configs_ends_within_one_request_time() {
+        let (events, elapsed) = strict_run_against_a_silent_webhook("t-prompt16", 16).await;
+
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "a strict failure did not end the execution within one request time \
+             (16 configs, 1 s timeout): {elapsed:?}"
+        );
+    }
+
+    /// One config answers 400 at once and a second one only after 5 s: the
+    /// failed request ends the execution, the second one is not awaited.
+    #[tokio::test]
+    async fn strict_failure_does_not_wait_for_the_other_configs_of_its_event() {
+        install_crypto_provider();
+        async fn reject() -> StatusCode {
+            StatusCode::BAD_REQUEST
+        }
+        async fn slow() -> StatusCode {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            StatusCode::ACCEPTED
+        }
+        let (url, shutdown_tx, server) = serve(
+            Router::new()
+                .route("/fail", post(reject))
+                .route("/slow", post(slow)),
+        )
+        .await;
+        let handler = strict_push_handler(IndexedEventsExecutor {
+            count: 0,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-two", "ctx-t-two").await;
+        for (id, path) in [("a-slow", "slow"), ("b-fail", "fail")] {
+            let mut config = push_config("t-two");
+            config.id = Some(id.into());
+            config.url = format!("{url}{path}");
+            handler.create_push_config(&params, config).await.unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-two"))
             .await
             .unwrap()
             .collect::<Vec<_>>()
@@ -2479,11 +2553,228 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(events.last().is_some_and(Result::is_err), "{events:?}");
-        assert!(!completed_task_event(&events), "{events:?}");
         assert!(
-            elapsed < Duration::from_millis(2500),
-            "a strict failure did not end the execution promptly: {elapsed:?}"
+            elapsed < Duration::from_secs(1),
+            "the failed request did not end the execution: {elapsed:?}"
         );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// Ten events 300 ms apart and a webhook that answers 400 at once: the
+    /// failure is noticed while events are still arriving, so the stream ends
+    /// at the next event with fewer than ten of them published. Without the
+    /// per-event check the run would go on to the terminal event (3.3 s).
+    #[tokio::test]
+    async fn strict_failure_ends_the_execution_at_the_next_event() {
+        install_crypto_provider();
+        async fn reject() -> StatusCode {
+            StatusCode::BAD_REQUEST
+        }
+        let (url, shutdown_tx, server) = serve(Router::new().route("/", post(reject))).await;
+        let handler = strict_push_handler(IndexedEventsExecutor {
+            count: 10,
+            gap: Duration::from_millis(300),
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-next", "ctx-t-next").await;
+        let mut config = push_config("t-next");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-next"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        let published = events.iter().filter(|event| event.is_ok()).count();
+        assert!(published < 10, "{published} events were published");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "the failure was not noticed at the next event: {elapsed:?}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// The first request fails and every later one is counted: the pushes of
+    /// the events already queued behind the failed one are skipped, not sent
+    /// after the execution has ended.
+    #[tokio::test]
+    async fn strict_failure_skips_the_pushes_queued_behind_it() {
+        install_crypto_provider();
+        async fn fail_first(State(hits): State<Arc<AtomicI32>>) -> StatusCode {
+            if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::ACCEPTED
+            }
+        }
+        let hits = Arc::new(AtomicI32::new(0));
+        let app = Router::new()
+            .route("/", post(fail_first))
+            .with_state(Arc::clone(&hits));
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = strict_push_handler(IndexedEventsExecutor {
+            count: 10,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-skip", "ctx-t-skip").await;
+        let mut config = push_config("t-skip");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-skip"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+
+        // Give a queue that was not abandoned time to drain.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "pushes queued behind the failure were still delivered"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// A failure recorded on the execution ends a wait on a push outcome that
+    /// never completes, at once.
+    #[tokio::test]
+    async fn a_recorded_push_failure_wakes_a_pending_wait() {
+        let active = ActiveExecution::new(Task {
+            id: "t-wake".into(),
+            context_id: "ctx-t-wake".into(),
+            status: TaskStatus {
+                state: TaskState::Working,
+                message: None,
+                timestamp: None,
+            },
+            artifacts: None,
+            history: None,
+            metadata: None,
+        });
+        let (_never, outcome) = oneshot::channel::<Result<(), A2AError>>();
+        let recorder = Arc::clone(&active);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            recorder.record_push_failure(A2AError::internal("push failed"));
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            await_push_or_failure(&active, outcome),
+        )
+        .await
+        .expect("the recorded failure did not wake the wait");
+        assert!(result.is_err());
+    }
+
+    /// An error known before any request is sent fails the event
+    /// synchronously in strict mode too: the first event (a working update)
+    /// is not published, the stream starts with the error. Without the check
+    /// the error would only surface at the terminal wait, after the working
+    /// event.
+    #[tokio::test]
+    async fn strict_precheck_error_fails_the_event_synchronously() {
+        install_crypto_provider();
+        let handler = DefaultRequestHandler::new(
+            IndexedEventsExecutor {
+                count: 1,
+                gap: Duration::ZERO,
+            },
+            InMemoryTaskStore::new(),
+        )
+        .with_push_notifications(
+            InMemoryPushConfigStore::new(),
+            crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                fail_on_error: true,
+                ..Default::default()
+            })),
+        );
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-spre", "ctx-t-spre").await;
+        let mut config = push_config("t-spre");
+        config.url = "http://169.254.169.254/hook".into();
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-spre"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        let first_error = events
+            .iter()
+            .position(Result::is_err)
+            .unwrap_or_else(|| panic!("the blocked URL was not reported: {events:?}"));
+        assert!(
+            events[first_error]
+                .as_ref()
+                .is_err_and(|error| error.message.contains("blocked host")),
+            "{events:?}"
+        );
+        assert!(
+            !events[..first_error]
+                .iter()
+                .any(|event| matches!(event, Ok(StreamResponse::StatusUpdate(_)))),
+            "an event was published before the blocked URL was reported: {events:?}"
+        );
+    }
+
+    /// A push URL on a blocked host fails a cancellation, with the flag off
+    /// and with it on.
+    #[tokio::test]
+    async fn cancel_with_a_blocked_push_url_fails_in_both_modes() {
+        install_crypto_provider();
+        for fail_on_error in [false, true] {
+            let task_id = format!("t-cpre-{fail_on_error}");
+            let handler = DefaultRequestHandler::new(PushEventExecutor, InMemoryTaskStore::new())
+                .with_push_notifications(
+                    InMemoryPushConfigStore::new(),
+                    crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
+                        fail_on_error,
+                        ..Default::default()
+                    })),
+                );
+            let params = ServiceParams::new();
+            seed_task(&handler, &task_id, &format!("ctx-{task_id}")).await;
+            let mut config = push_config(&task_id);
+            config.url = "http://169.254.169.254/hook".into();
+            handler.create_push_config(&params, config).await.unwrap();
+
+            let result = handler
+                .cancel_task(
+                    &params,
+                    CancelTaskRequest {
+                        id: task_id.clone(),
+                        metadata: None,
+                        tenant: None,
+                    },
+                )
+                .await;
+            let error = result.expect_err("the blocked URL was not reported");
+            assert!(
+                error.message.contains("blocked host"),
+                "fail_on_error={fail_on_error}: {error:?}"
+            );
+        }
     }
 
     /// With 8 busy tasks of 4 slow webhooks each the shared pool of 32 is

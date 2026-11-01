@@ -34,8 +34,11 @@
 //!   [`HttpPushSender`]'s `fail_on_error`) waits behind everything already
 //!   queued for the task: up to [`PUSH_QUEUE_CAPACITY_PER_TASK`] events x
 //!   `ceil(configs / 4)` x the time of one request, unless a failure is
-//!   recorded first; the failure ends the wait and the jobs queued behind it
-//!   are skipped.
+//!   recorded first. A strict job reports its first failed request at once:
+//!   the other requests of the event are cancelled or never started, the
+//!   caller's error sink abandons the jobs queued behind it, and nothing is
+//!   awaited after that first error, so the failure is known about one
+//!   request time after the first request of the failing event was sent.
 //! * The worker for a task is removed in the same critical section that finds
 //!   its queue empty, so a later event for the task starts a new worker and
 //!   two workers for one task never overlap. A panic inside a delivery is
@@ -260,7 +263,7 @@ impl PushDispatcher {
         // the queue, so each webhook sees the task's events in order. The
         // task delivers to `per_task` configs at a time; the shared permit is
         // taken by the sender around each request only.
-        let results = futures::stream::iter(configs)
+        let mut deliveries = futures::stream::iter(configs)
             .map(|config| {
                 let sender = Arc::clone(&sender);
                 let permits = Arc::clone(&self.permits);
@@ -273,13 +276,22 @@ impl PushDispatcher {
                     sender.send_push_gated(&config, event, Some(&permits)).await
                 }
             })
-            .buffer_unordered(self.per_task)
-            .collect::<Vec<_>>()
-            .await;
+            .buffer_unordered(self.per_task);
 
+        let strict = sender.fail_on_error();
         let mut first = None;
-        for error in results.into_iter().filter_map(Result::err) {
+        while let Some(result) = deliveries.next().await {
+            let Err(error) = result else { continue };
             tracing::error!(task_id, %error, "push delivery failed");
+            if strict {
+                // A strict sender stops at the first failed request: the
+                // error is returned at once, so the caller reports it (which
+                // also abandons the jobs queued behind this one), and
+                // dropping `deliveries` here cancels the requests still in
+                // flight and never starts the ones that have not begun.
+                // Nothing is awaited after the first error.
+                return Some(error);
+            }
             first.get_or_insert(error);
         }
         first
@@ -322,7 +334,9 @@ mod tests {
 
     fn job(store: Arc<dyn PushConfigStore>) -> PushJob {
         // Building an HTTP client is expensive; the tests that enqueue
-        // thousands of jobs share one sender.
+        // thousands of jobs share one sender. This sender must never send:
+        // its pooled connections would outlive the test runtime that opened
+        // them, so these tests use stores that list no configs or panic.
         static SENDER: std::sync::OnceLock<Arc<HttpPushSender>> = std::sync::OnceLock::new();
         PushJob {
             event: Some(working_task()),
