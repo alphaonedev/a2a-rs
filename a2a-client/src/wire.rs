@@ -101,7 +101,7 @@ pub(crate) async fn send(
 
 /// Reads a response body to text, logging status and body, so callers parse
 /// from the string instead of `Response::json` — the raw bytes have to be seen
-/// first. The error is unmapped so each caller keeps its own message.
+/// first. The error carries context, so each caller keeps its own message.
 pub(crate) async fn response_text(
     resp: reqwest::Response,
     max_bytes: usize,

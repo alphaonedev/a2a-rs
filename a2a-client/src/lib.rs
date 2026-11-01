@@ -57,7 +57,8 @@ pub fn default_reqwest_client(
 /// slower than that ends the call with an error. It is `None` by default so a
 /// quiet Server-Sent Events stream is not cut: pick a value longer than the
 /// longest gap the agent leaves between stream events. The response size cap
-/// bounds memory; this bounds time.
+/// bounds memory; this bounds each wait, not the total: a peer that sends a byte
+/// inside every interval is bounded only by the cap or a request timeout.
 pub fn default_reqwest_client_with_read_timeout(
     #[allow(unused_variables)] extra_root_pem: Option<&[u8]>,
     read_timeout: Option<std::time::Duration>,
