@@ -24,10 +24,22 @@ pub struct HttpPushSenderConfig {
     /// [`HttpPushSender::send_push`] instead of only being logged.
     ///
     /// [`DefaultRequestHandler`](crate::DefaultRequestHandler) delivers
-    /// pushes on a background queue, so an error cannot fail the event that
-    /// caused it. It is logged, recorded on the task's execution, and ends the
-    /// execution with an error to its subscribers before the next event is
-    /// applied. It never fails `cancel_task`.
+    /// pushes on a background queue, so while the flag is off an error never
+    /// delays or fails the event that caused it and is only logged. With the
+    /// flag on, every failure reaches the caller:
+    ///
+    /// * a failure noticed while the execution is still running is recorded
+    ///   and ends the execution with an error to its subscribers at the next
+    ///   event after it was recorded, not necessarily the next event;
+    /// * the terminal event, and the end of an execution that stopped without
+    ///   one, wait for the pending deliveries of the task, so a failure of the
+    ///   last push is published as the final error instead of the event
+    ///   (a latency cost that strict mode opts into, bounded by the request
+    ///   timeout);
+    /// * an event dropped because the task's push queue was full is reported
+    ///   as an error naming the full queue;
+    /// * `cancel_task` waits for the delivery of the cancellation events and
+    ///   returns the error, as it did before deliveries moved to a queue.
     pub fail_on_error: bool,
     /// If true (default), guard push URLs against SSRF. A string pre-check
     /// (scheme must be http/https; host must not be a loopback, private,
@@ -85,11 +97,30 @@ impl HttpPushSender {
         }
     }
 
+    /// Whether delivery errors are returned rather than only logged.
+    pub(crate) fn fail_on_error(&self) -> bool {
+        self.fail_on_error
+    }
+
     /// Send an event to the push notification endpoint.
     pub async fn send_push(
         &self,
         config: &TaskPushNotificationConfig,
         event: StreamResponse,
+    ) -> Result<(), A2AError> {
+        self.send_push_gated(config, event, None).await
+    }
+
+    /// [`Self::send_push`] with an optional limiter on requests in flight.
+    ///
+    /// A permit of `gate` is held only while the HTTP request is in flight,
+    /// never while validation runs and never between attempts, so a limiter
+    /// shared by many deliveries bounds requests, not deliveries.
+    pub(crate) async fn send_push_gated(
+        &self,
+        config: &TaskPushNotificationConfig,
+        event: StreamResponse,
+        gate: Option<&tokio::sync::Semaphore>,
     ) -> Result<(), A2AError> {
         if self.validate_urls {
             validate_push_url(&config.url)?;
@@ -143,6 +174,11 @@ impl HttpPushSender {
             }
         }
 
+        // The semaphore is never closed, so `acquire` cannot fail.
+        let _permit = match gate {
+            Some(gate) => gate.acquire().await.ok(),
+            None => None,
+        };
         match request.send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {

@@ -5,7 +5,7 @@ use a2a::*;
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, oneshot};
 
 use crate::push::dispatcher::{PushDispatcher, PushErrorSink, PushJob};
 
@@ -215,33 +215,62 @@ fn should_interrupt_non_streaming(
     }
 }
 
-/// Hand `event` to the background push dispatcher.
+/// Receives the outcome of one queued push job.
+type PushOutcome = oneshot::Receiver<Result<(), A2AError>>;
+
+/// Hand `event` (or, for `None`, a barrier that completes once the task's
+/// earlier pushes are delivered) to the background push dispatcher.
 ///
 /// Never waits for delivery: the event is queued behind the earlier events of
 /// the same task and delivered by that task's worker. Does nothing when push
 /// notifications are not configured. A delivery failure is logged by the
-/// dispatcher and, when `on_error` is given, reported to it.
-fn send_push_notifications(
+/// dispatcher and reported to `on_error`. With `wait` the outcome is returned
+/// instead, for a caller that waits for it (see [`await_push`]).
+fn enqueue_push(
     dispatcher: &Arc<PushDispatcher>,
     task_id: &str,
     push_config_store: Option<&Arc<dyn crate::PushConfigStore>>,
     push_sender: Option<&Arc<crate::HttpPushSender>>,
-    event: &StreamResponse,
+    event: Option<&StreamResponse>,
     on_error: Option<PushErrorSink>,
-) {
+    wait: bool,
+) -> Option<PushOutcome> {
     let (Some(store), Some(sender)) = (push_config_store, push_sender) else {
-        return;
+        return None;
+    };
+    let (done, outcome) = if wait {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
     };
     dispatcher.enqueue(
         task_id,
         PushJob {
-            event: event.clone(),
-            terminal: is_terminal_event(event),
+            event: event.cloned(),
+            terminal: event.is_none_or(is_terminal_event),
             store: Arc::clone(store),
             sender: Arc::clone(sender),
             on_error,
+            done,
         },
     );
+    outcome
+}
+
+/// The first delivery error of a job enqueued with `wait`.
+async fn await_push(outcome: PushOutcome) -> Result<(), A2AError> {
+    outcome
+        .await
+        .unwrap_or_else(|_| Err(crate::push::dispatcher::worker_lost_error()))
+}
+
+/// Whether delivery failures must reach the caller (`fail_on_error`).
+fn push_is_strict(
+    push_config_store: Option<&Arc<dyn crate::PushConfigStore>>,
+    push_sender: Option<&Arc<crate::HttpPushSender>>,
+) -> bool {
+    push_config_store.is_some() && push_sender.is_some_and(|sender| sender.fail_on_error())
 }
 
 async fn save_task(task_store: &dyn crate::TaskStore, mut task: Task) -> Result<Task, A2AError> {
@@ -396,11 +425,22 @@ async fn drive_execution(
     // Push delivery runs in the background, so a failed delivery (reported
     // only when the sender is configured with `fail_on_error`) cannot abort
     // the loop at the event that caused it. It is recorded on the execution
-    // and ends the loop before the next event is applied.
+    // and ends the loop at the next event after it was recorded. The terminal
+    // event, and the end of an execution that stops without one, wait for the
+    // task's pending pushes when the sender is strict, so no failure is lost
+    // after the loop has stopped reading the record.
     let on_push_error: PushErrorSink = {
         let active = Arc::clone(&active);
         Arc::new(move |error| active.record_push_failure(error))
     };
+    let strict = push_is_strict(
+        runtime.push_config_store.as_ref(),
+        runtime.push_sender.as_ref(),
+    );
+    // Pushes were enqueued that no later wait has covered yet.
+    let mut unflushed = false;
+    // The execution already published its final error.
+    let mut failed = false;
 
     while let Some(result) = stream.next().await {
         if active.snapshot_is_terminal().await {
@@ -408,6 +448,7 @@ async fn drive_execution(
         }
         if let Some(error) = active.take_push_failure() {
             active.publish(Err(&error), None).await;
+            failed = true;
             break;
         }
 
@@ -419,28 +460,69 @@ async fn drive_execution(
                 {
                     Ok(updated_task) => {
                         current_task = updated_task.clone();
-                        send_push_notifications(
+                        let terminal = is_terminal_event(&event);
+                        let wait = strict && terminal;
+                        let outcome = enqueue_push(
                             &runtime.push_dispatcher,
                             &task_id,
                             runtime.push_config_store.as_ref(),
                             runtime.push_sender.as_ref(),
-                            &event,
+                            Some(&event),
                             Some(Arc::clone(&on_push_error)),
+                            wait,
                         );
+                        if let Some(outcome) = outcome {
+                            // Strict terminal event: its own failure, or any
+                            // earlier one recorded meanwhile, is published
+                            // instead of the event, as before pushes were
+                            // queued.
+                            unflushed = false;
+                            let result = await_push(outcome).await;
+                            if let Some(error) = active.take_push_failure().or(result.err()) {
+                                active.publish(Err(&error), None).await;
+                                failed = true;
+                                break;
+                            }
+                        } else {
+                            unflushed = strict;
+                        }
                         active.publish(Ok(&event), updated_task).await;
-                        if is_terminal_event(&event) {
+                        if terminal {
                             break;
                         }
                     }
                     Err(error) => {
                         active.publish(Err(&error), None).await;
+                        failed = true;
                         break;
                     }
                 }
             }
             Err(error) => {
                 active.publish(Err(&error), None).await;
+                failed = true;
                 break;
+            }
+        }
+    }
+
+    // The loop ended without a terminal event (the executor stopped, or the
+    // task was finished elsewhere): wait for the pushes still in flight so
+    // that a failure of one of them is reported instead of only logged.
+    if strict && unflushed && !failed {
+        let outcome = enqueue_push(
+            &runtime.push_dispatcher,
+            &task_id,
+            runtime.push_config_store.as_ref(),
+            runtime.push_sender.as_ref(),
+            None,
+            None,
+            true,
+        );
+        if let Some(outcome) = outcome {
+            let result = await_push(outcome).await;
+            if let Some(error) = active.take_push_failure().or(result.err()) {
+                active.publish(Err(&error), None).await;
             }
         }
     }
@@ -1056,16 +1138,25 @@ impl RequestHandler for DefaultRequestHandler {
                             .await?;
                     current_task = updated_task.clone();
 
-                    // Delivery is queued, never awaited: a slow or failing
-                    // webhook can neither delay nor fail the cancellation.
-                    send_push_notifications(
+                    // Delivery is queued: a slow or failing webhook can
+                    // neither delay nor fail the cancellation, unless the
+                    // sender is strict (`fail_on_error`), in which case the
+                    // cancellation waits for the delivery and returns its
+                    // error, as it did before deliveries were queued.
+                    let wait =
+                        push_is_strict(self.push_config_store.as_ref(), self.push_sender.as_ref());
+                    let outcome = enqueue_push(
                         &self.push_dispatcher,
                         &req.id,
                         self.push_config_store.as_ref(),
                         self.push_sender.as_ref(),
-                        &event,
+                        Some(&event),
                         None,
+                        wait,
                     );
+                    if let Some(outcome) = outcome {
+                        await_push(outcome).await?;
+                    }
 
                     if let Some(active) = &active_execution {
                         active.publish(Ok(&event), updated_task).await;
@@ -1919,28 +2010,89 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn failed_push_with_fail_on_error_ends_the_execution() {
-        install_crypto_provider();
-        async fn reject() -> StatusCode {
-            StatusCode::INTERNAL_SERVER_ERROR
+    /// Emits one working update, then waits until the webhook has answered at
+    /// least once before it completes the task. No timing is involved: the
+    /// terminal event is produced only after a delivery attempt has finished.
+    struct GatedExecutor {
+        answered: Arc<Notify>,
+    }
+
+    impl crate::AgentExecutor for GatedExecutor {
+        fn execute(
+            &self,
+            ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            let working = StreamResponse::StatusUpdate(TaskStatusUpdateEvent {
+                task_id: ctx.task_id.clone(),
+                context_id: ctx.context_id.clone(),
+                status: TaskStatus {
+                    state: TaskState::Working,
+                    message: None,
+                    timestamp: None,
+                },
+                metadata: None,
+            });
+            let answered = Arc::clone(&self.answered);
+            let completed = StreamResponse::Task(Task {
+                id: ctx.task_id.clone(),
+                context_id: ctx.context_id.clone(),
+                status: TaskStatus {
+                    state: TaskState::Completed,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            });
+            Box::pin(
+                stream::once(async move { Ok(working) }).chain(stream::once(async move {
+                    answered.notified().await;
+                    Ok(completed)
+                })),
+            )
         }
-        let (url, shutdown_tx, server) = serve(Router::new().route("/", post(reject))).await;
-        let handler = DefaultRequestHandler::new(
-            IndexedEventsExecutor {
-                count: 6,
-                gap: Duration::from_millis(100),
-            },
-            InMemoryTaskStore::new(),
-        )
-        .with_push_notifications(
+
+        fn cancel(
+            &self,
+            _ctx: ExecutorContext,
+        ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+            Box::pin(stream::empty())
+        }
+    }
+
+    /// Webhook that signals `answered` and then refuses the push.
+    async fn rejecting_push(State(answered): State<Arc<Notify>>) -> StatusCode {
+        answered.notify_one();
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    fn strict_push_handler(executor: impl crate::AgentExecutor) -> DefaultRequestHandler {
+        DefaultRequestHandler::new(executor, InMemoryTaskStore::new()).with_push_notifications(
             InMemoryPushConfigStore::new(),
             crate::HttpPushSender::new(Some(crate::HttpPushSenderConfig {
                 validate_urls: false,
                 fail_on_error: true,
                 ..Default::default()
             })),
-        );
+        )
+    }
+
+    fn completed_task_event(events: &[Result<StreamResponse, A2AError>]) -> bool {
+        events.iter().any(|event| {
+            matches!(event, Ok(StreamResponse::Task(task)) if task.status.state == TaskState::Completed)
+        })
+    }
+
+    #[tokio::test]
+    async fn failed_push_with_fail_on_error_ends_the_execution() {
+        install_crypto_provider();
+        let answered = Arc::new(Notify::new());
+        let app = Router::new()
+            .route("/", post(rejecting_push))
+            .with_state(Arc::clone(&answered));
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = strict_push_handler(GatedExecutor { answered });
         let params = ServiceParams::new();
         seed_task(&handler, "t-fail", "ctx-t-fail").await;
         let mut config = push_config("t-fail");
@@ -1954,13 +2106,188 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
-        // The failure is not lost: the stream ends with an error, before the
-        // task could complete.
+        // The failure is not lost, whichever event it was noticed at: the
+        // stream ends with an error and never reports the task as completed.
         assert!(events.last().is_some_and(Result::is_err), "{events:?}");
-        assert!(events.len() < 7, "execution kept running: {events:?}");
+        assert!(!completed_task_event(&events), "{events:?}");
 
         shutdown_tx.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_on_error_surfaces_a_failed_push_of_the_terminal_event() {
+        install_crypto_provider();
+        async fn reject() -> StatusCode {
+            StatusCode::BAD_REQUEST
+        }
+        let (url, shutdown_tx, server) = serve(Router::new().route("/", post(reject))).await;
+        // No events before the terminal one: the failure can only be noticed
+        // after the last event has been handed to the dispatcher.
+        let handler = strict_push_handler(IndexedEventsExecutor {
+            count: 0,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-term", "ctx-t-term").await;
+        let mut config = push_config("t-term");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-term"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(!completed_task_event(&events), "{events:?}");
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_on_error_reports_events_dropped_from_a_full_queue() {
+        install_crypto_provider();
+        async fn counting_push(State(sender): State<mpsc::UnboundedSender<()>>) -> StatusCode {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sender.send(());
+            StatusCode::ACCEPTED
+        }
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = Router::new().route("/", post(counting_push)).with_state(tx);
+        let (url, shutdown_tx, server) = serve(app).await;
+        let handler = strict_push_handler(IndexedEventsExecutor {
+            count: 200,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-drop", "ctx-t-drop").await;
+        let mut config = push_config("t-drop");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let events = handler
+            .send_streaming_message(&params, streaming_request("t-drop"))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+
+        let error = events
+            .iter()
+            .find_map(|event| event.as_ref().err())
+            .unwrap_or_else(|| {
+                panic!(
+                    "a dropped push event was not reported: {} events",
+                    events.len()
+                )
+            });
+        assert!(
+            error.message.contains("push notification queue full"),
+            "the error must name the condition: {error:?}"
+        );
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_on_error_cancel_reports_a_failed_push() {
+        install_crypto_provider();
+        async fn reject() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+        let (url, shutdown_tx, server) = serve(Router::new().route("/", post(reject))).await;
+        let handler = strict_push_handler(PushEventExecutor);
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-cancel-strict", "ctx-t-cancel-strict").await;
+        let mut config = push_config("t-cancel-strict");
+        config.url = url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let result = handler
+            .cancel_task(
+                &params,
+                CancelTaskRequest {
+                    id: "t-cancel-strict".into(),
+                    metadata: None,
+                    tenant: None,
+                },
+            )
+            .await;
+        assert!(result.is_err(), "{result:?}");
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// Latency of the first push of an unrelated task while `slow_configs`
+    /// webhook configs of another task are busy.
+    async fn victim_first_push_latency(slow_url: String, slow_configs: usize) -> Duration {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let fast = Router::new()
+            .route("/", post(indexed_push))
+            .with_state(sender);
+        let (fast_url, fast_tx, fast_srv) = serve(fast).await;
+        let handler = local_push_handler(IndexedEventsExecutor {
+            count: 1,
+            gap: Duration::ZERO,
+        });
+        let params = ServiceParams::new();
+        seed_task(&handler, "t-busy", "ctx-t-busy").await;
+        for index in 0..slow_configs {
+            let mut config = push_config("t-busy");
+            config.id = Some(format!("cfg-{index}"));
+            config.url = slow_url.clone();
+            handler.create_push_config(&params, config).await.unwrap();
+        }
+        seed_task(&handler, "t-victim", "ctx-t-victim").await;
+        let mut config = push_config("t-victim");
+        config.url = fast_url;
+        handler.create_push_config(&params, config).await.unwrap();
+
+        let mut events = handler
+            .send_streaming_message(&params, streaming_request("t-busy"))
+            .await
+            .unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+        let started = std::time::Instant::now();
+        let mut events = handler
+            .send_streaming_message(&params, streaming_request("t-victim"))
+            .await
+            .unwrap();
+        while let Some(event) = events.next().await {
+            event.unwrap();
+        }
+        timeout(Duration::from_secs(60), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let elapsed = started.elapsed();
+        fast_tx.send(()).unwrap();
+        fast_srv.await.unwrap();
+        elapsed
+    }
+
+    #[tokio::test]
+    async fn slow_webhooks_of_one_task_do_not_starve_other_tasks() {
+        install_crypto_provider();
+        let slow = Router::new()
+            .route("/", post(slow_push))
+            .with_state(Duration::from_secs(3));
+        let (slow_url, slow_tx, slow_srv) = serve(slow).await;
+        let elapsed = victim_first_push_latency(slow_url, 40).await;
+        slow_tx.send(()).unwrap();
+        drop(slow_srv);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "an unrelated task's push waited for another task's webhooks: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
