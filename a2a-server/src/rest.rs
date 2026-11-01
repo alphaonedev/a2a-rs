@@ -532,7 +532,7 @@ mod tests {
     use crate::InMemoryPushConfigStore;
     use crate::executor::ExecutorContext;
     use crate::handler::DefaultRequestHandler;
-    use crate::task_store::InMemoryTaskStore;
+    use crate::task_store::{InMemoryTaskStore, TaskStore};
     use a2a_pb::protojson_conv;
     use axum::body::Body;
     use axum::http::Request;
@@ -596,10 +596,26 @@ mod tests {
         rest_router(handler)
     }
 
-    fn make_push_app() -> axum::Router {
+    async fn make_push_app() -> axum::Router {
         install_crypto_provider();
+        let store = InMemoryTaskStore::new();
+        store
+            .create(Task {
+                id: "t1".into(),
+                context_id: "ctx".into(),
+                status: TaskStatus {
+                    state: TaskState::Submitted,
+                    message: None,
+                    timestamp: None,
+                },
+                artifacts: None,
+                history: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
         let handler = Arc::new(
-            DefaultRequestHandler::new(EchoExecutor, InMemoryTaskStore::new())
+            DefaultRequestHandler::new(EchoExecutor, store)
                 .with_push_config_store(InMemoryPushConfigStore::new()),
         );
         rest_router(handler)
@@ -750,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_accepts_raw_config_body() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let body = serde_json::json!({
             "id": "cfg1",
             "url": "http://example.com/callback"
@@ -772,7 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_accepts_flat_request_body() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let body = serde_json::json!({
             "taskId": "t1",
             "id": "cfg1",
@@ -795,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_push_config_rejects_mismatched_task_id_in_body() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let body = serde_json::json!({
             "taskId": "other-task",
             "url": "http://example.com/callback"
@@ -1047,7 +1063,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_push_configs() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let req = Request::builder()
             .uri("/tasks/t1/pushNotificationConfigs")
             .method("GET")
@@ -1075,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_push_config_with_store_returns_ok() {
-        let app = make_push_app();
+        let app = make_push_app().await;
         let create_body = serde_json::json!({
             "id": "cfg1",
             "url": "http://example.com/callback"

@@ -672,6 +672,14 @@ impl DefaultRequestHandler {
     /// agent does not support push notifications (§13.3). Distinct from
     /// [`Self::push_config_store`], which reports the *deployment* state — a
     /// store that was never supplied — with the same error code.
+    /// Returns `TaskNotFound` unless the task store holds `task_id`.
+    async fn require_existing_task(&self, task_id: &str) -> Result<(), A2AError> {
+        match self.task_store.get(task_id).await? {
+            Some(_) => Ok(()),
+            None => Err(A2AError::task_not_found(task_id)),
+        }
+    }
+
     fn push_config_store_checked(&self) -> Result<&dyn crate::PushConfigStore, A2AError> {
         self.require_push_notifications()?;
         self.push_config_store()
@@ -1079,7 +1087,12 @@ impl RequestHandler for DefaultRequestHandler {
         req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
         self.authorize(params, Some(&req.task_id))?;
-        self.push_config_store_checked()?.save(req).await
+        let store = self.push_config_store_checked()?;
+        // Configs are keyed by task id and the store caps configs per task,
+        // not task ids, so a config for a task that does not exist is both
+        // a spec violation (TaskNotFound) and unbounded memory growth.
+        self.require_existing_task(&req.task_id).await?;
+        store.save(req).await
     }
 
     async fn get_push_config(
@@ -2999,6 +3012,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_push_config_for_unknown_task_is_rejected() {
+        install_crypto_provider();
+        let handler = make_handler_with_push_configs();
+        let params = ServiceParams::new();
+
+        let result = handler
+            .create_push_config(&params, push_config("no-such-task"))
+            .await;
+        assert!(
+            matches!(result, Err(ref err) if err.code == A2AError::task_not_found("x").code),
+            "expected TaskNotFound, got {result:?}"
+        );
+
+        // Nothing was stored for the unknown task id.
+        let listed = handler
+            .push_config_store()
+            .unwrap()
+            .list("no-such-task")
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+
+        // An existing task still accepts a config.
+        seed_task(&handler, "t-known", "ctx").await;
+        handler
+            .create_push_config(&params, push_config("t-known"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_push_config_not_supported_without_store() {
         let handler = make_handler();
         let params = ServiceParams::new();
@@ -3023,6 +3067,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
+        seed_task(&handler, "t1", "ctx").await;
         handler
             .create_push_config(
                 &params,
@@ -3295,6 +3340,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
+        seed_task(&handler, "t1", "ctx").await;
         // Keep the count below InMemoryPushConfigStore's per-task cap
         // (MAX_PUSH_CONFIGS_PER_TASK), which rejects the 51st config.
         for i in 0..40 {
@@ -3339,6 +3385,7 @@ mod tests {
         install_crypto_provider();
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
+        seed_task(&handler, "t1", "ctx").await;
 
         let created = handler
             .create_push_config(
@@ -3532,6 +3579,7 @@ mod tests {
         let (url, mut receiver, shutdown_tx, server) = start_push_webhook().await;
         let handler = make_push_delivery_handler();
         let params = ServiceParams::new();
+        seed_task(&handler, "t-push-stored", "c-push-stored").await;
 
         handler
             .create_push_config(
@@ -3551,7 +3599,6 @@ mod tests {
         let mut message = make_message();
         message.task_id = Some("t-push-stored".into());
         message.context_id = Some("c-push-stored".into());
-        seed_task(&handler, "t-push-stored", "c-push-stored").await;
         let response = handler
             .send_message(
                 &params,
@@ -3718,6 +3765,7 @@ mod tests {
     async fn test_undeclared_capabilities_stay_permissive() {
         let handler = make_handler_with_push_configs();
         let params = ServiceParams::new();
+        seed_task(&handler, "t1", "ctx").await;
 
         assert!(
             handler
@@ -3769,6 +3817,7 @@ mod tests {
             InMemoryPushConfigStore::new(),
             crate::HttpPushSender::new(None),
         );
+        seed_task(&handler, "t1", "ctx").await;
         assert_eq!(handler.capabilities.push_notifications, Some(true));
         assert!(
             handler
